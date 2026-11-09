@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "local-video-context"
+version = "0.1.0"
+description = "Local course video context extraction API and CLI"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+  "fastapi>=0.115,<1", "uvicorn>=0.30,<1", "python-multipart>=0.0.18",
+  "faster-whisper>=1.2,<2", "scenedetect>=0.7,<0.8",
+  "opencv-python==4.10.0.84", "opencv-contrib-python==4.10.0.84",
+  "paddleocr>=3,<4", "paddlepaddle>=3,<4", "Pillow>=10", "av>=14"
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "httpx>=0.27"]
+gpu-windows = ["nvidia-cublas-cu12==12.9.2.10; sys_platform == 'win32'"]
+
+[project.scripts]
+video-context = "video_context.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["video_context*"]
+
+[tool.setuptools.package-data]
+video_context = ["static/*", "static/assets/*", "static/swagger/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
