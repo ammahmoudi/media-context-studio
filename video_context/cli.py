@@ -78,6 +78,10 @@ def main():
                 storage.ensure_bucket()
                 print("Database schema version 1 and object storage are ready.")
             else:
+                from .resources import install_native_memory_limit
+                # Keep this handle alive: the Windows worker and its children
+                # share a hard commit budget even outside Docker.
+                native_memory_limit = install_native_memory_limit()
                 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
                 runner = Worker(database, storage, settings.data, args.queues.split(",") if args.queues else None)
                 signal.signal(signal.SIGINT, lambda *_: runner.stop_event.set())
@@ -89,7 +93,7 @@ def main():
     if args.command == "serve":
         import uvicorn
 
-        uvicorn.run("video_context.service:app", host=args.host, port=args.port, workers=1)
+        uvicorn.run("video_context.service:app", host=args.host, port=args.port, workers=1, limit_concurrency=8)
     elif args.command == "prepare-models":
         from .pipeline import prepare_ocr, speech_model
 

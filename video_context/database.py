@@ -37,8 +37,9 @@ class LeaseLost(Exception):
 class Database:
     def __init__(self, url, capacity=32, lease_seconds=120, max_attempts=3):
         self.capacity, self.lease_seconds, self.max_attempts = capacity, lease_seconds, max_attempts
-        self.engine = create_engine(url, pool_pre_ping=True,
-            connect_args={"check_same_thread": False, "timeout": 30} if url.startswith("sqlite") else {})
+        self.engine = create_engine(url, pool_pre_ping=True, pool_size=2, max_overflow=2, pool_timeout=10,
+            connect_args={"check_same_thread": False, "timeout": 30} if url.startswith("sqlite") else {
+                "connect_timeout": 5, "options": "-c statement_timeout=15000 -c lock_timeout=5000"})
         self.sqlite = self.engine.dialect.name == "sqlite"
         if self.sqlite:
             @event.listens_for(self.engine, "connect")
@@ -97,14 +98,16 @@ class Database:
             conn.execute(update(jobs).where(jobs.c.id == job_id).values(**fields))
             return data
 
-    def claim(self, owner, queues):
-        with self.transaction() as conn:
+    def claim(self, owner, queues, resource_domain=None, max_parallel=1, fail_on_worker_loss=False, admit=True):
+        # Serialize admission across replicas; the queue remains durable while a
+        # host/GPU's shared inference slots are occupied.
+        with self.transaction(serialize=True) as conn:
             expired = conn.execute(select(jobs).where(jobs.c.status == "running", jobs.c.lease_until < time.time())
                                    .with_for_update(skip_locked=True)).mappings().all()
             for row in expired:
-                exhausted = row["attempt"] >= self.max_attempts
+                exhausted = row["attempt"] >= self.max_attempts or row["data"].get("fail_on_worker_loss", False)
                 data = dict(row["data"], status="failed" if exhausted else "queued", stage="lease expired",
-                            error="Worker heartbeat expired", updated_at=now())
+                            error="Worker heartbeat expired; inspect memory/container events before explicit retry" if exhausted else "Worker heartbeat expired", updated_at=now())
                 if exhausted:
                     data["finished_at"] = now()
                 conn.execute(update(jobs).where(jobs.c.id == row["id"]).values(
@@ -115,19 +118,42 @@ class Database:
             for row in abandoned:
                 data = dict(row["data"], status="failed", stage="failed", error="Input ingestion expired", finished_at=now())
                 conn.execute(update(jobs).where(jobs.c.id == row["id"]).values(status="failed", data=data))
+            if not admit:
+                return None
+            if resource_domain:
+                owners = set(conn.execute(select(jobs.c.owner).where(jobs.c.status == "running",
+                    jobs.c.data["resource_domain"].as_string() == resource_domain)).scalars())
+                # A cancelled job may still be inside a native inference call.
+                # Keep its slot until the worker actually drains or disappears.
+                busy = conn.execute(select(workers.c.id, workers.c.data).where(
+                    workers.c.seen > time.time() - self.lease_seconds,
+                    workers.c.data["resource_domain"].as_string() == resource_domain)).all()
+                owners.update(worker_id for worker_id, data in busy if data.get("job_id"))
+                if len(owners) >= max_parallel:
+                    return None
             row = conn.execute(select(jobs).where(jobs.c.status == "queued", jobs.c.queue.in_(queues))
                 .order_by(jobs.c.created, jobs.c.id).limit(1).with_for_update(skip_locked=True)).mappings().first()
             if row is None:
                 return None
             attempt = row["attempt"] + 1
             data = dict(row["data"], status="running", stage="starting", started_at=now(),
-                        updated_at=now(), worker_id=owner, attempt=attempt, error=None)
+                        updated_at=now(), worker_id=owner, attempt=attempt, error=None,
+                        resource_domain=resource_domain, fail_on_worker_loss=fail_on_worker_loss)
             conn.execute(update(jobs).where(jobs.c.id == row["id"]).values(status="running", owner=owner,
                 lease_until=time.time() + self.lease_seconds, attempt=attempt, data=data))
+            if resource_domain:
+                worker_data = conn.execute(select(workers.c.data).where(workers.c.id == owner)).scalar_one_or_none()
+                values = dict(worker_data or {"hostname": owner, "queues": queues, "device": "starting", "model": "starting",
+                    "memory_mb": 0, "cpu_percent": 0, "cpu_threads": 0, "stopping": False},
+                    job_id=row["id"], resource_domain=resource_domain)
+                if worker_data is None:
+                    conn.execute(insert(workers).values(id=owner, seen=time.time(), data=values))
+                else:
+                    conn.execute(update(workers).where(workers.c.id == owner).values(seen=time.time(), data=values))
             return data
 
     def heartbeat(self, worker_id, data, job_id=None):
-        with self.transaction() as conn:
+        with self.transaction(serialize=True) as conn:
             # Lock ownership updates with completion/reaping so expired workers cannot renew.
             if job_id:
                 renewed = conn.execute(update(jobs).where(jobs.c.id == job_id, jobs.c.owner == worker_id,

@@ -33,16 +33,28 @@ The database itself is the durable queue; Redis is not required. API replicas re
 States are `uploading → queued → running → complete / partial / failed`, with `cancelled` available for queued/running jobs. `GET /v1/jobs` includes live work, paginated/filterable history, queue positions, counts, and worker resources. Search and history filters are server-side.
 
 - Each worker process runs one job at a time and retains its loaded model between jobs.
-- Workers report heartbeats about every five seconds. The UI considers a worker offline after 30 seconds.
-- A running job's default lease is 120 seconds, renewed independently of slow scene detection/inference. Expired leases requeue the attempt; the default maximum is three attempts.
+- Workers sample resources/report heartbeats about every two seconds. The UI considers a worker offline after 30 seconds.
+- A running job's default lease is 120 seconds, renewed independently of slow scene detection/inference. Production workers mark expired attempts failed, requiring an explicit retry after inspecting memory/container events. This prevents repeating an OOM job after each restart. The lower-level database claim API retains optional bounded crash retries for integrations that explicitly choose them.
 - Ownership checks fence progress/final-state updates. Attempt-specific object prefixes prevent a stale worker from overwriting a newer attempt's published artifacts.
-- Delivery is **at least once**, not exactly once. A killed/partitioned worker can overlap with a replacement until it detects lease loss. Only the owner can publish the database result pointer.
+- Execution is not exactly once. An explicit retry after a partition can overlap with an old worker until it detects lease loss. Only the owner can publish the database result pointer.
 - Cancellation updates durable state immediately; computation stops at its next progress checkpoint. A long decoder/scene scan may take time to reach that checkpoint.
 - Retry creates a new job linked by `retry_of`, reusing the source object. Published partial/failed evidence is retained.
 - The `default` and `cpu` queues are handled by the default Docker CPU worker. The laptop GPU worker listens to `gpu`. The UI prefers the GPU queue when a matching GPU worker is online.
-- CPU worker replicas can be increased independently of API processes. Run one worker per GPU/device to avoid memory contention; do not scale several workers onto one laptop GPU accidentally.
+- Shared resource domains limit concurrent execution transactionally across replicas. The default is one active CPU run per domain and one GPU run per physical device. Give workers on the same host/device the same domain, including native and container workers. Separate hosts/devices need distinct domains. Raising `VIDEO_CONTEXT_MAX_PARALLEL` requires a measured memory budget.
 
-The worker page shows process CPU/RAM/threads, queue subscriptions, model, current job, heartbeat age, and GPU device memory/utilization when `nvidia-smi` is available. GPU memory is the device total, including other applications, not an allocation exclusive to this service.
+The worker page shows process CPU/RAM/threads, available memory and its host/cgroup limit, sampled process-tree peak RAM, queue subscriptions, model, current job, heartbeat age, and GPU device memory/utilization. Workers waiting for resources show the reason. Each new run stores sampled peak RAM and whole-device VRAM in its database record; context exports include the pre-publication sample. GPU memory includes other applications, not an allocation exclusive to this service.
+
+## OOM and scratch protection
+
+- Transcription reads **120-second core windows with two seconds of context on each side**, bounded to 300 seconds even if misconfigured higher. PCM audio is on disk; a 57-minute recording no longer creates a complete float waveform and speech-feature array in RAM. A default window's waveform is at most about **7.6 MiB**. Words are assigned to a single core by midpoint to avoid duplicate overlap captions. Windowing can change recognition/segmentation near boundaries; it does not validate transcription accuracy.
+- Before claiming work, workers require 1,536 MiB available RAM and 2,048 MiB scratch space. Linux checks the smaller of host availability and remaining cgroup memory, allowing for reclaimable inactive file cache. GPU workers require fresh telemetry, with 3,072 MiB free VRAM for a cold model or 768 MiB for an already-loaded model. Running jobs tolerate a telemetry timeout using the last successful reading for at most ten seconds; longer telemetry loss fails closed.
+- During work, resource sampling/checkpoints enforce 384 MiB RAM and 256 MiB VRAM headroom plus the scratch reserve. Pressure fails the current job with `resource_exhausted`; it does not silently publish a partial success. Native allocation/OOM errors also fail the job. Waiting for resources does not consume an attempt.
+- Docker worker hard limit is 4 GiB, with a 3,584 MiB cooperative process-tree budget. API/PostgreSQL limits are 512 MiB each; storage is 1 GiB. Memory+swap limits equal RAM limits, avoiding swap thrashing. The steady default stack totals **6 GiB** in configured hard limits. The init container is separately capped at 256 MiB.
+- Windows standalone workers install a **6 GiB Job Object commit limit including child processes**, failing startup if it cannot be installed. This includes FFmpeg. Embedded laptop workers only have cooperative checks; use the standalone worker or Docker for hard isolation. Linux standalone workers require a container/systemd cgroup for hard isolation.
+- Inputs exceeding six hours or 3,840×2,160 decoded pixels are rejected before scene decoding. Scene count is capped at 5,000; OCR observations and speech segments at 50,000 each; structured context at 16 MiB. These guardrails are configurable where exposed in `.env.example`. Individual frames stay on disk, and model inference remains sequential.
+- Audio scratch capacity is checked using estimated PCM size before decoding. Downloads reserve twice input size plus the free-space floor. Upload concurrency is two per API process, parsed context reads are serialized with a memory admission check, API connections are capped at eight, and body byte limits apply to chunked requests before multipart parsing. Docker multipart temporary files live on `/data`, with disk checks while receiving/copying. Overload returns 429/503; insufficient upload scratch returns 507. Database pools are bounded to four connections per process, with five-second PostgreSQL connect/lock and fifteen-second statement timeouts.
+
+Hard limits contain failure; they cannot guarantee an individual job will never OOM. Cooperative checks cannot interrupt a native model/decoder allocation already in flight. GPU VRAM is shared with desktop/other apps and has no hard per-process cap here. Peak readings are sampled roughly every two seconds and can miss short spikes. Run measured workloads before raising concurrency; resource admission is deliberately conservative.
 
 ## Storage backend choice
 
@@ -58,7 +70,8 @@ Docker must be running. Generate credentials once:
 
 ```powershell
 python scripts/setup_env.py
-docker compose up -d --build
+docker compose build api worker
+python scripts/start_stack.py
 ```
 
 Open <http://127.0.0.1:18765/> and sign in with `VIDEO_CONTEXT_API_KEY` from `.env`. The API, worker, PostgreSQL, and object store have separate containers and persistent volumes. API containers do not install ML inference runtimes. Images use pinned Python dependency snapshots, a locked frontend, cached dependency layers, non-root application processes, health checks, and CPU/memory limits.
@@ -76,10 +89,10 @@ This laptop uses `VIDEO_CONTEXT_MODELS_VOLUME=./.models` in its ignored `.env` t
 To scale CPU workers:
 
 ```powershell
-docker compose up -d --scale worker=2
+python scripts/start_stack.py --cpu-workers 2 --check-only
 ```
 
-Each CPU worker is limited to four CPUs and 6 GiB RAM by default. API replicas share PostgreSQL/S3, but publishing multiple replicas on one fixed host port requires a reverse proxy/load balancer. The bundled single PostgreSQL and single object-store node are persistent local services, **not a high-availability deployment**.
+The startup helper checks combined configured limits, current usage of unrelated containers, 1 GiB Docker headroom, and at least 2 GiB host availability. It refuses unsafe starts/scales, including the optional GPU container when capacity is insufficient. Re-run without `--check-only` after sizing passes. A second replica also needs 4 GiB budget even though the default shared domain serializes inference; increase domain concurrency only after measuring peaks. Direct `docker compose up` bypasses this aggregate check. Each worker defaults to four CPUs. API replicas share PostgreSQL/S3, but publishing multiple replicas on one fixed host port requires a reverse proxy/load balancer. The bundled single PostgreSQL and single object-store node are persistent local services, **not a high-availability deployment**.
 
 ## Use this laptop's NVIDIA GPU
 
@@ -94,7 +107,8 @@ Submit GPU jobs with `"queue": "gpu"`, or use the dashboard. The helper reads co
 An optional Linux CUDA container target/profile is also provided:
 
 ```powershell
-docker compose --profile gpu up -d --build gpu-worker
+docker compose --profile gpu build gpu-worker
+python scripts/start_stack.py --gpu
 ```
 
 It requires a working NVIDIA container runtime/GPU passthrough and the model weights in the shared cache. The CUDA image tag was verified; the GPU-container profile has not been built or runtime-validated on this laptop. The native GPU-worker path is used for local validation. Choose one GPU-worker path per physical GPU.
@@ -136,7 +150,7 @@ Back up PostgreSQL **and** the object bucket plus deployment credentials. A surv
 
 ## Validation
 
-- Automated unit/API suite: **26 tests passed**, covering existing extraction plus durable claims, restart persistence, leases/fencing, queue routing/capacity, cancellation/retry, input deduplication/integrity, authentication, CSRF checks, upload limits, video ranges, and Unicode history search.
+- Automated unit/API/resource suite: **41 tests passed** on Windows, covering existing extraction, durable claims, restart persistence, leases/fencing, queue routing/capacity, cancellation/draining slots, explicit crash retry, input integrity, auth, chunked-body limits, context backpressure, video ranges, Unicode search, cgroup/cache accounting, bounded audio windows/boundary timestamps, pressure admission, telemetry grace, allocation-failure reporting, and a real Windows hard-limit allocation test. The Windows-specific test is skipped on Linux.
 - Two opt-in integration tests passed against real Docker PostgreSQL and RustFS: concurrent claims/capacity, separate worker execution, S3 artifacts, byte-range reads/HEAD, and persistence across API restarts. Each test uses its own temporary database and bucket.
 - Browser inspection loaded the full course video (3,451.85 seconds) and 1,151 showing Persian caption cues.
 - Frontend production build, TypeScript, and lint passed.
@@ -144,6 +158,9 @@ Back up PostgreSQL **and** the object bucket plus deployment credentials. A surv
 - A real authenticated deployment smoke test submitted a CPU job to the Docker worker and a Persian speech job to the independent native GPU worker. Both completed and published retrievable S3 artifacts. CPU extraction took 1.407 seconds; the two-minute GPU extraction took 32.071 seconds (OCR disabled). These are extraction timings, excluding queue wait/ingestion and final artifact transfer.
 - The same smoke test verified authenticated byte-range streaming of the migrated full course and all 1,151 WebVTT caption cues. [Local smoke report](../data/production-smoke.json).
 - Real English OCR in the Linux CPU-worker container completed in 12.966 seconds with four observations and no extraction warnings, using the existing portable model cache. [Local OCR smoke report](../data/docker-ocr-smoke.json).
+- After memory hardening, a five-minute real course test completed GPU transcription across three bounded audio windows plus English OCR in **147.376 seconds**, producing 39 speech segments and 114 OCR observations. Sampled peak process-tree RAM was **1,216 MiB**, whole-device VRAM peaked at **2,974 MiB**, and sampled host RAM availability stayed above **5,295 MiB**. [GPU memory smoke report](../data/memory-smoke-gpu.json).
+- Docker CPU OCR on the two-minute excerpt completed in **36.695 seconds**, producing 66 observations with **736.5 MiB** sampled peak process-tree RAM under the 4 GiB limit. At least 3,475 MiB effective cgroup memory remained available. [CPU memory smoke report](../data/memory-smoke-cpu.json).
+- Capacity checks accepted the 6 GiB default stack plus unrelated-container usage and 1 GiB reserve, and refused the additional 4 GiB GPU-container profile on this laptop. Running containers report enforced RAM+swap limits and no OOM kills/restarts. These short-run measurements do not replace peak/load testing at a larger concurrency.
 - Private GitHub repository: <https://github.com/ammahmoudi/video-context-service>.
 
 Run integration checks after starting the infrastructure:

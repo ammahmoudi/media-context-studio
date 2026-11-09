@@ -391,6 +391,13 @@ export function Workers({
 							</div>
 						</div>
 						<p className="muted">Model: {w.model}</p>
+						{w.blocked_reason && <p className="error" role="status">Waiting for resources: {w.blocked_reason}</p>}
+						{w.memory_available_mb != null && <p className="muted">
+							{Math.round(w.memory_available_mb)} MiB available · {Math.round(w.memory_limit_mb ?? 0)} MiB {w.memory_scope} limit
+						</p>}
+						{w.peak_memory_mb != null && <p className="muted">
+							Peak process tree: {Math.round(w.peak_memory_mb)} MiB · {w.max_parallel} active run per resource domain
+						</p>}
 						{w.gpu_memory_used_mb != null && (
 							<p className="muted">
 								GPU device: {Math.round(w.gpu_memory_used_mb)} /{" "}
@@ -415,7 +422,7 @@ export function Workers({
 									Processing {w.job_id.slice(0, 8)} <ArrowRight size={14} />
 								</Link>
 							) : (
-								<span>{w.stopping ? "Draining" : "Idle"}</span>
+								<span>{w.stopping ? "Draining" : w.blocked_reason ? "Waiting for resources" : "Idle"}</span>
 							)}
 							<span>
 								{Math.round(w.last_seen_seconds_ago)}s since heartbeat

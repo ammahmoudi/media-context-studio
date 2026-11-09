@@ -21,6 +21,7 @@ COPY requirements.lock.txt ./
 RUN --mount=type=cache,target=/root/.cache/pip pip install -r requirements.lock.txt
 
 FROM api-deps AS api
+ENV TMPDIR=/data
 COPY pyproject.toml README.md ./
 COPY video_context/ ./video_context/
 COPY --from=frontend /build/video_context/static/ ./video_context/static/

@@ -1,5 +1,6 @@
 """Incremental OCR: retain evidence for stable pixels and recognize dirty regions."""
 from pathlib import Path
+from .resources import ResourceExhausted
 
 
 def intersects(a, b):
@@ -120,6 +121,8 @@ def read_incremental(folder: Path, frames, options, output, progress, model_fact
                                 "text": text, "confidence": float(score),
                                 "bbox_xyxy_normalized": [min(1, max(0, x)) for x in box]}
                         output.append(item)
+                        if len(output) > 50000:
+                            raise ResourceExhausted("Too many text observations; reduce sampled frames or split the recording")
                         current.append(item)
             frame["ocr"] = {"method": "full" if is_full else "patches" if rectangles else "reuse",
                             "text_ids": [item["id"] for item in current],

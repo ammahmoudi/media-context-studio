@@ -12,11 +12,16 @@ from pathlib import Path
 from . import __version__
 from .config import MODELS, WHISPER_COMPUTE, WHISPER_DEVICE, WHISPER_MODEL
 from .models import Options
+from .resources import ResourceExhausted, check_disk, is_resource_error, number, validate_media
+from .database import LeaseLost
 
 
 def save_json(path: Path, data):
     temporary = path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    serialized = json.dumps(data, ensure_ascii=False, indent=2)
+    if len(serialized.encode("utf-8")) > number("MAX_CONTEXT_MB", 16, 1) * 1024**2:
+        raise ResourceExhausted("Structured context exceeds configured size limit; reduce frames or split the recording")
+    temporary.write_text(serialized, encoding="utf-8")
     # Windows readers/indexers can briefly deny replacement of an open file.
     # Preserve atomic writes, but allow a short sharing conflict to clear.
     for attempt in range(8):
@@ -68,6 +73,8 @@ def detect_shots(path, source):
     # Convert detector frame indices to actual PTS: nominal FPS gives wrong shot
     # times for variable-frame-rate recordings. Only internal boundaries matter.
     pairs = detect(str(path), ContentDetector(), start_in_scene=True)
+    if len(pairs) > number("MAX_SHOTS", 5000, 1):
+        raise ResourceExhausted("Too many scene boundaries; split the recording")
     offset, duration = source["video_offset_seconds"], source["duration_seconds"]
     cut_indices = {pair[0].frame_num for pair in pairs[1:]}
     cuts = []
@@ -137,6 +144,7 @@ def extract_frames(path, folder, source, shots, options):
     with av.open(str(path)) as container:
         stream = next(s for s in container.streams.video if s.index == source["video_stream_index"])
         stream.thread_type = "AUTO"
+        stream.thread_count = int(number("CPU_THREADS", 4, 1))
         for decoded in container.decode(stream):
             if target_idx >= len(targets):
                 break
@@ -220,30 +228,60 @@ def transcribe(path, folder, source, options, progress=lambda stage: None):
 
     wav = folder / "audio.wav"
     try:
-        run(["ffmpeg", "-nostdin", "-y", "-v", "error", "-i", str(path), "-map",
+        check_disk(folder, int(source["duration_seconds"] * 32000))
+        run(["ffmpeg", "-nostdin", "-y", "-v", "error", "-threads", str(int(number("CPU_THREADS", 4, 1))), "-i", str(path), "-map",
              f"0:{source['audio_stream_index']}", "-vn", "-ar", "16000", "-ac", "1",
-             "-c:a", "pcm_s16le", str(wav)])
+             "-t", str(source["duration_seconds"]), "-c:a", "pcm_s16le", str(wav)])
         # FFmpeg has already decoded the stream. Use Whisper's documented array
         # input rather than decoding it again through its older PyAV wrapper.
+        output = []
+        offset, duration = source["audio_offset_seconds"], source["duration_seconds"]
+        chunk_seconds = min(300, number("AUDIO_CHUNK_SECONDS", 120, 10))
+        overlap = 2
+        language = options.language
         with wave.open(str(wav), "rb") as audio_file:
             if (audio_file.getnchannels(), audio_file.getsampwidth(), audio_file.getframerate()) != (1, 2, 16000):
                 raise ValueError("Expected 16 kHz mono PCM16 audio")
-            samples = np.frombuffer(audio_file.readframes(audio_file.getnframes()), dtype="<i2").astype(np.float32) / 32768.0
-        segments, info = speech_model().transcribe(samples, language=options.language,
-                                                   vad_filter=True, word_timestamps=True)
-        output = []
-        offset = source["audio_offset_seconds"]
-        duration = source["duration_seconds"]
-        for segment in segments:
-            progress(f"speech {min(duration, segment.end + offset):.1f}/{duration:.1f}s")
-            start, end = max(0, segment.start + offset), min(duration, segment.end + offset)
-            if end <= start:
-                continue
-            output.append({"id": f"speech_{len(output) + 1:05d}", "start_seconds": start,
-                           "end_seconds": end, "text": segment.text.strip(), "language": info.language,
-                           "words": [{"text": w.word, "start_seconds": max(0, w.start + offset),
-                                      "end_seconds": min(duration, w.end + offset), "probability": w.probability}
-                                     for w in segment.words or [] if w.end + offset > 0 and w.start + offset < duration]})
+            audio_duration = audio_file.getnframes() / 16000
+            for index in range(math.ceil(audio_duration / chunk_seconds)):
+                core_start = index * chunk_seconds
+                core_end = min(audio_duration, core_start + chunk_seconds)
+                window_start = max(0, core_start - overlap)
+                window_end = min(audio_duration, core_end + overlap)
+                progress(f"speech {min(duration, core_start + offset):.1f}/{duration:.1f}s")
+                audio_file.setpos(round(window_start * 16000))
+                samples = np.frombuffer(audio_file.readframes(round((window_end - window_start) * 16000)), dtype="<i2").astype(np.float32)
+                samples /= 32768.0  # in-place: no second float waveform
+                segments, info = speech_model().transcribe(samples, language=language,
+                                                          vad_filter=True, word_timestamps=True)
+                for segment in segments:
+                    progress(f"speech {min(duration, window_start + segment.end + offset):.1f}/{duration:.1f}s")
+                    shift = window_start + offset
+                    # Each word belongs to exactly one core window by midpoint.
+                    # Overlap gives the model context across window boundaries.
+                    words = [w for w in segment.words or [] if core_start <= window_start + (w.start + w.end) / 2 < core_end]
+                    if segment.words:
+                        if not words:
+                            continue
+                        start, end = words[0].start + shift, words[-1].end + shift
+                        text = "".join(w.word for w in words).strip()
+                    else:
+                        if not core_start <= window_start + (segment.start + segment.end) / 2 < core_end:
+                            continue
+                        start, end, text = segment.start + shift, segment.end + shift, segment.text.strip()
+                    start, end = max(0, start), min(duration, end)
+                    if end <= start:
+                        continue
+                    output.append({"id": f"speech_{len(output) + 1:05d}", "start_seconds": start,
+                                   "end_seconds": end, "text": text, "language": info.language,
+                                   "words": [{"text": w.word, "start_seconds": max(0, w.start + shift),
+                                              "end_seconds": min(duration, w.end + shift), "probability": w.probability}
+                                             for w in words if w.end + shift > 0 and w.start + shift < duration]})
+                    if len(output) > 50000:
+                        raise ResourceExhausted("Too many speech segments; split the recording")
+                if output and language is None:
+                    language = info.language
+                del segments, samples
         return output
     finally:
         wav.unlink(missing_ok=True)
@@ -298,6 +336,8 @@ def analyze(path: Path, folder: Path, options: Options, progress=lambda stage: N
     started = time.perf_counter()
     progress("metadata")
     source = inspect(path)
+    validate_media(source)
+    check_disk(folder, options.max_frames * 1024**2)
     with path.open("rb") as handle:
         source["sha256"] = hashlib.file_digest(handle, "sha256").hexdigest()
     packages = ["fastapi", "faster-whisper", "scenedetect", "paddleocr", "paddlepaddle", "av"]
@@ -306,7 +346,9 @@ def analyze(path: Path, folder: Path, options: Options, progress=lambda stage: N
                "visual_descriptions": [], "events": [], "warnings": [],
                "settings": options.model_dump(), "versions": {p: importlib.metadata.version(p) for p in packages},
                "service_version": __version__, "whisper_model": WHISPER_MODEL,
-               "speech_runtime": {"device": WHISPER_DEVICE, "compute_type": WHISPER_COMPUTE},
+               "speech_runtime": {"device": WHISPER_DEVICE, "compute_type": WHISPER_COMPUTE,
+                                  "audio_chunk_seconds": min(300, number("AUDIO_CHUNK_SECONDS", 120, 10)),
+                                  "audio_overlap_seconds": 2},
                "exports": {"speech_captions": "captions/speech.srt", "readable_context": "context.md"},
                "timing_convention": "seconds relative to format start; intervals are [start, end)"}
 
@@ -319,6 +361,8 @@ def analyze(path: Path, folder: Path, options: Options, progress=lambda stage: N
             action()
             record["status"] = "complete"
         except Exception as error:
+            if isinstance(error, LeaseLost) or is_resource_error(error):
+                raise
             record.update(status="failed", error=str(error))
             context["status"] = "partial"
             context["warnings"].append(f"{name}: {error}")

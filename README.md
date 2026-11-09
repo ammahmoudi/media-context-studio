@@ -8,7 +8,8 @@ The web studio provides an operations overview, durable run history, worker reso
 
 ```powershell
 python scripts/setup_env.py
-docker compose up -d --build
+docker compose build api worker
+python scripts/start_stack.py
 ```
 
 Open [the studio](http://127.0.0.1:18765/) and sign in with `VIDEO_CONTEXT_API_KEY` from the generated `.env`. [Swagger](http://127.0.0.1:18765/docs) shares the authenticated browser session; other clients send `X-API-Key`.

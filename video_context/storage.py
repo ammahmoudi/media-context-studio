@@ -7,6 +7,7 @@ from pathlib import Path, PurePosixPath
 
 from fastapi import HTTPException
 from fastapi.responses import FileResponse, Response, StreamingResponse
+from .resources import number
 
 
 def safe_key(key):
@@ -74,10 +75,13 @@ class Storage:
             shutil.copy2(self.path(key), path)
 
     def read_json(self, key):
+        maximum = int(number("MAX_CONTEXT_MB", 16, 1) * 1024**2)
+        if self.size(key) > maximum:
+            raise HTTPException(413, "Structured context exceeds the configured response size limit")
         if self.client:
             obj = self.client.get_object(Bucket=self.bucket, Key=safe_key(key))
             try:
-                return json.loads(obj["Body"].read())
+                return json.loads(obj["Body"].read(maximum + 1))
             finally:
                 obj["Body"].close()
         return json.loads(self.path(key).read_text(encoding="utf-8"))

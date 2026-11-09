@@ -15,6 +15,14 @@ x-environment: &environment
   VIDEO_CONTEXT_WHISPER_DEVICE: cpu
   VIDEO_CONTEXT_WHISPER_COMPUTE: int8
   VIDEO_CONTEXT_CPU_THREADS: ${VIDEO_CONTEXT_CPU_THREADS:-4}
+  VIDEO_CONTEXT_AUDIO_CHUNK_SECONDS: ${VIDEO_CONTEXT_AUDIO_CHUNK_SECONDS:-120}
+  VIDEO_CONTEXT_START_FREE_RAM_MB: ${VIDEO_CONTEXT_START_FREE_RAM_MB:-1536}
+  VIDEO_CONTEXT_MIN_FREE_RAM_MB: ${VIDEO_CONTEXT_MIN_FREE_RAM_MB:-384}
+  VIDEO_CONTEXT_MIN_FREE_DISK_MB: ${VIDEO_CONTEXT_MIN_FREE_DISK_MB:-2048}
+  VIDEO_CONTEXT_WORKER_MAX_RAM_MB: ${VIDEO_CONTEXT_WORKER_MAX_RAM_MB:-3584}
+  VIDEO_CONTEXT_MAX_DURATION_SECONDS: ${VIDEO_CONTEXT_MAX_DURATION_SECONDS:-21600}
+  VIDEO_CONTEXT_MAX_VIDEO_PIXELS: ${VIDEO_CONTEXT_MAX_VIDEO_PIXELS:-8294400}
+  VIDEO_CONTEXT_MAX_PARALLEL: ${VIDEO_CONTEXT_MAX_PARALLEL:-1}
   OMP_NUM_THREADS: ${VIDEO_CONTEXT_CPU_THREADS:-4}
   OPENBLAS_NUM_THREADS: ${VIDEO_CONTEXT_CPU_THREADS:-4}
   VIDEO_CONTEXT_API_KEY: ${VIDEO_CONTEXT_API_KEY:?Set VIDEO_CONTEXT_API_KEY in .env}
@@ -36,7 +44,9 @@ services:
       timeout: 3s
       retries: 20
     restart: unless-stopped
-    mem_limit: 1g
+    mem_limit: ${VIDEO_CONTEXT_POSTGRES_MEMORY:-512m}
+    memswap_limit: ${VIDEO_CONTEXT_POSTGRES_MEMORY:-512m}
+    command: ["postgres", "-c", "shared_buffers=128MB", "-c", "work_mem=4MB", "-c", "max_connections=40"]
 
   object-store:
     image: rustfs/rustfs:1.0.4
@@ -58,7 +68,8 @@ services:
       retries: 30
       start_period: 15s
     restart: unless-stopped
-    mem_limit: 2g
+    mem_limit: ${VIDEO_CONTEXT_STORAGE_MEMORY:-1g}
+    memswap_limit: ${VIDEO_CONTEXT_STORAGE_MEMORY:-1g}
 
   init:
     image: video-context-api:local
@@ -69,6 +80,8 @@ services:
       postgres: {condition: service_healthy}
       object-store: {condition: service_healthy}
     restart: "no"
+    mem_limit: 256m
+    memswap_limit: 256m
 
   api:
     image: video-context-api:local
@@ -84,7 +97,8 @@ services:
       timeout: 5s
       retries: 5
     restart: unless-stopped
-    mem_limit: 1g
+    mem_limit: ${VIDEO_CONTEXT_API_MEMORY:-512m}
+    memswap_limit: ${VIDEO_CONTEXT_API_MEMORY:-512m}
     security_opt: ["no-new-privileges:true"]
 
   worker:
@@ -93,12 +107,14 @@ services:
     environment:
       <<: *environment
       VIDEO_CONTEXT_WORKER_QUEUES: default,cpu
+      VIDEO_CONTEXT_RESOURCE_DOMAIN: ${VIDEO_CONTEXT_CPU_RESOURCE_DOMAIN:-local-stack:cpu}
     depends_on:
       init: {condition: service_completed_successfully}
     volumes: ["worker-scratch:/data", "${VIDEO_CONTEXT_MODELS_VOLUME:-model-cache}:/models"]
     restart: unless-stopped
     stop_grace_period: 90s
-    mem_limit: 6g
+    mem_limit: ${VIDEO_CONTEXT_WORKER_MEMORY:-4g}
+    memswap_limit: ${VIDEO_CONTEXT_WORKER_MEMORY:-4g}
     cpus: ${VIDEO_CONTEXT_CPU_THREADS:-4}
     security_opt: ["no-new-privileges:true"]
 
@@ -112,6 +128,10 @@ services:
       VIDEO_CONTEXT_WHISPER_DEVICE: cuda
       VIDEO_CONTEXT_WHISPER_COMPUTE: int8_float16
       VIDEO_CONTEXT_WORKER_QUEUES: gpu
+      VIDEO_CONTEXT_RESOURCE_DOMAIN: ${VIDEO_CONTEXT_GPU_RESOURCE_DOMAIN:-local-stack:gpu:0}
+      VIDEO_CONTEXT_START_FREE_VRAM_MB: ${VIDEO_CONTEXT_START_FREE_VRAM_MB:-3072}
+      VIDEO_CONTEXT_WARM_FREE_VRAM_MB: ${VIDEO_CONTEXT_WARM_FREE_VRAM_MB:-768}
+      VIDEO_CONTEXT_MIN_FREE_VRAM_MB: ${VIDEO_CONTEXT_MIN_FREE_VRAM_MB:-256}
     depends_on:
       init: {condition: service_completed_successfully}
     volumes: ["gpu-scratch:/data", "${VIDEO_CONTEXT_MODELS_VOLUME:-model-cache}:/models"]
@@ -121,7 +141,8 @@ services:
           devices: [{driver: nvidia, count: 1, capabilities: [gpu]}]
     restart: unless-stopped
     stop_grace_period: 90s
-    mem_limit: 6g
+    mem_limit: ${VIDEO_CONTEXT_GPU_WORKER_MEMORY:-4g}
+    memswap_limit: ${VIDEO_CONTEXT_GPU_WORKER_MEMORY:-4g}
 
 volumes:
   model-cache:

@@ -17,6 +17,8 @@ export type Job = {
 	finished_at?: string;
 	source?: { duration_seconds: number; width: number; height: number };
 	artifacts?: { path: string; bytes: number }[];
+	resources?: { peak_memory_mb: number; peak_gpu_memory_mb?: number; memory_limit_mb: number };
+	error_code?: string;
 };
 export type Snapshot = {
 	running: Job[];
@@ -47,6 +49,13 @@ export type Worker = {
 	gpu_utilization_percent?: number;
 	last_seen_seconds_ago: number;
 	stopping: boolean;
+	blocked_reason?: string;
+	memory_available_mb?: number;
+	memory_limit_mb?: number;
+	memory_scope?: string;
+	peak_memory_mb?: number;
+	resource_domain?: string;
+	max_parallel?: number;
 };
 export type Health = {
 	status: string;

@@ -230,6 +230,10 @@ export default function RunDetail({
 							<dt>Run time</dt>
 							<dd>{duration(r?.elapsed_seconds)}</dd>
 						</div>
+						{r?.resources && <div>
+							<dt>Peak RAM (sampled)</dt>
+							<dd>{Math.round(r.resources.peak_memory_mb)} MiB</dd>
+						</div>}
 						<div>
 							<dt>Worker</dt>
 							<dd>{r?.worker_id ?? "Not assigned"}</dd>

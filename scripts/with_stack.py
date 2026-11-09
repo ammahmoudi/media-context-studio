@@ -39,6 +39,9 @@ def configure():
     for key, value in settings.items():
         if value is not None:
             os.environ.setdefault(key, value)
+    for key, configured in values.items():
+        if key.startswith("VIDEO_CONTEXT_"):
+            os.environ.setdefault(key, configured)
 
 
 if __name__ == "__main__":

@@ -2,9 +2,7 @@
 import logging
 import html
 import os
-import shutil
 import socket
-import subprocess
 import tempfile
 import threading
 import time
@@ -16,7 +14,8 @@ import psutil
 from .config import WHISPER_DEVICE, WHISPER_MODEL
 from .database import LeaseLost, now
 from .models import Options
-from .pipeline import analyze, caption_time, save_json, write_exports
+from .pipeline import analyze, caption_time, save_json, speech_model, write_exports
+from .resources import ResourceGuard, ResourceExhausted, check_disk, is_resource_error, number
 
 log = logging.getLogger(__name__)
 
@@ -43,6 +42,12 @@ class Worker:
         self.thread = None
         self.process = psutil.Process()
         self.process.cpu_percent()
+        self.guard = ResourceGuard(self.data, WHISPER_DEVICE)
+        domain_setting = "VIDEO_CONTEXT_GPU_RESOURCE_DOMAIN" if WHISPER_DEVICE == "cuda" else "VIDEO_CONTEXT_CPU_RESOURCE_DOMAIN"
+        self.resource_domain = os.getenv("VIDEO_CONTEXT_RESOURCE_DOMAIN", os.getenv(domain_setting, socket.gethostname() + ":" + WHISPER_DEVICE))
+        self.max_parallel = int(number("MAX_PARALLEL", 1, 1))
+        self.blocked_reason = None
+        self.resource_error = None
 
     def resources(self):
         process = self.process
@@ -51,46 +56,65 @@ class Worker:
                 "memory_mb": round(process.memory_info().rss / 1024**2, 1),
                 "cpu_percent": process.cpu_percent(), "cpu_threads": process.num_threads(),
                 "heartbeat_at": time.time(), "stopping": self.stop_event.is_set()}
-        if WHISPER_DEVICE == "cuda":
-            try:
-                output = subprocess.run(["nvidia-smi", "--query-gpu=memory.used,memory.total,utilization.gpu",
-                    "--format=csv,noheader,nounits", "--id=" + os.getenv("VIDEO_CONTEXT_GPU_INDEX", "0")],
-                    check=True, capture_output=True, text=True, timeout=2).stdout
-                used, total, utilization = (float(value.strip()) for value in output.strip().split(","))
-                payload.update(gpu_memory_used_mb=used, gpu_memory_total_mb=total, gpu_utilization_percent=utilization)
-            except (OSError, ValueError, subprocess.SubprocessError):
-                pass
+        payload.update(self.guard.sample(), blocked_reason=self.blocked_reason,
+                       resource_domain=self.resource_domain, max_parallel=self.max_parallel)
         return payload
 
     def heartbeat(self):
         while not self.heartbeat_stop.is_set():
             job_id = self.current
             try:
+                if job_id:
+                    try:
+                        self.guard.check()
+                    except ResourceExhausted as error:
+                        if self.current == job_id:
+                            self.resource_error = error
                 self.db.heartbeat(self.id, self.resources(), job_id)
             except LeaseLost:
                 if self.current == job_id:
                     self.lost.set()
+                # Continue reporting a draining/cancelled native call so another
+                # replica cannot take its hardware slot prematurely.
+                try:
+                    self.db.heartbeat(self.id, self.resources())
+                except Exception:
+                    log.exception("Draining worker heartbeat failed")
             except Exception:
                 log.exception("Worker heartbeat failed")
-            self.heartbeat_stop.wait(min(5, self.db.lease_seconds / 4))
+            self.heartbeat_stop.wait(min(2, self.db.lease_seconds / 4))
 
     def progress(self, job_id, stage):
         if self.lost.is_set():
             raise LeaseLost(job_id)
+        if self.resource_error:
+            raise self.resource_error
+        self.guard.check(gpu=False)
         self.db.update(job_id, owner=self.id, stage=stage)
 
     def run_one(self):
-        record = self.db.claim(self.id, self.queues)
+        # Housekeeping must continue even while this worker is under pressure.
+        self.db.claim(self.id, self.queues, admit=False)
+        try:
+            self.guard.check(starting=True, model_loaded=speech_model.cache_info().currsize > 0)
+            self.blocked_reason = None
+        except ResourceExhausted as error:
+            self.blocked_reason = str(error)
+            return False
+        record = self.db.claim(self.id, self.queues, self.resource_domain, self.max_parallel, fail_on_worker_loss=True)
         if not record:
             return False
         self.current = record["id"]
         self.lost.clear()
+        self.resource_error = None
+        self.guard.reset()
         work_root = self.data / "work"
         work_root.mkdir(parents=True, exist_ok=True)
         try:
             with tempfile.TemporaryDirectory(prefix=f"{record['id']}-", dir=work_root) as temporary:
                 folder = Path(temporary)
                 source = folder / ("source" + record.get("input_suffix", ".mp4"))
+                check_disk(folder, record.get("input_bytes", 0) * 2)
                 self.storage.download(record["input_key"], source)
                 output = folder / record["id"]
                 context = self.analyze(source, output, Options.model_validate(record["options"]),
@@ -100,6 +124,7 @@ class Worker:
                 output.mkdir(exist_ok=True)
                 if context.get("source"):
                     context["source"]["file_name"] = record["source_file"]
+                    context["resources"] = self.guard.sample()
                     write_exports(output, context)
                     save_json(output / "context.json", context)
                 export_vtt(output, context)
@@ -114,18 +139,25 @@ class Worker:
                 self.db.update(record["id"], owner=self.id, status=context["status"], stage="finished",
                     elapsed_seconds=context["elapsed_seconds"], finished_at=now(),
                     result_prefix=prefix, artifacts=manifest, source=context.get("source"),
-                    warnings=context.get("warnings", []), stages=context.get("stages", {}))
+                    warnings=context.get("warnings", []), stages=context.get("stages", {}), resources=self.guard.sample())
         except LeaseLost:
             log.warning("Lost lease for job %s; output will not be published", record["id"])
         except Exception as error:
             log.exception("Job %s failed", record["id"])
             try:
-                self.db.update(record["id"], owner=self.id, status="failed", stage="failed", error=str(error), finished_at=now())
+                self.db.update(record["id"], owner=self.id, status="failed", stage="failed", error=str(error),
+                    error_code="resource_exhausted" if is_resource_error(error) else "processing_failed",
+                    resources=self.guard.sample(gpu=False), finished_at=now())
             except LeaseLost:
                 pass
         finally:
             self.current = None
             self.lost.clear()
+            self.resource_error = None
+            try:
+                self.db.heartbeat(self.id, self.resources())
+            except Exception:
+                log.exception("Could not release worker resource slot")
         return True
 
     def run(self, once=False):

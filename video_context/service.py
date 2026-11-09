@@ -1,4 +1,5 @@
 import json
+import asyncio
 import math
 import re
 import secrets
@@ -24,10 +25,40 @@ from .jobs import Jobs
 from .models import AnalyzeRequest, Options
 from .pipeline import analyze
 from .settings import Settings
+from .resources import ResourceExhausted, check_disk, memory_budget
 
 
 class Login(BaseModel):
     api_key: str = Field(max_length=4096)
+
+
+class BodyLimit:
+    """Bound chunked bodies too, before multipart spooling/JSON parsing."""
+    def __init__(self, app, upload_limit, scratch):
+        self.app, self.upload_limit, self.scratch = app, upload_limit, scratch
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or scope["method"] not in ("POST", "PUT", "PATCH"):
+            return await self.app(scope, receive, send)
+        uploading = scope["path"] == "/v1/jobs/upload"
+        maximum = self.upload_limit + 2 * 1024**2 if uploading else 1024**2
+        total = 0
+
+        async def bounded_receive():
+            nonlocal total
+            message = await receive()
+            body = message.get("body", b"")
+            total += len(body)
+            if total > maximum:
+                raise HTTPException(413, "Request body exceeds configured limit")
+            if uploading:
+                try:
+                    check_disk(self.scratch, len(body) * 2)
+                except ResourceExhausted as error:
+                    raise HTTPException(507, str(error)) from error
+            return message
+
+        await self.app(scope, bounded_receive, send)
 
 
 class DashboardFiles(StaticFiles):
@@ -51,12 +82,15 @@ def create_app(data_root=DATA, settings=None):
     @asynccontextmanager
     async def lifespan(app):
         app.state.jobs = Jobs(settings, analyze)
+        app.state.upload_slots = asyncio.BoundedSemaphore(2)
+        app.state.result_slots = asyncio.BoundedSemaphore(1)
         yield
         app.state.jobs.close()
 
     app = FastAPI(title="Video Context", version="0.2.0", lifespan=lifespan, docs_url=None,
                   description="Durable video extraction jobs, worker leases, private artifacts and video context.")
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=settings.allowed_hosts)
+    app.add_middleware(BodyLimit, upload_limit=settings.max_upload_bytes, scratch=settings.data)
     default_openapi = app.openapi
 
     def openapi():
@@ -88,7 +122,25 @@ def create_app(data_root=DATA, settings=None):
         raw_length = request.headers.get("content-length", "0")
         if raw_length.isdigit() and int(raw_length) > settings.max_upload_bytes + 2 * 1024**2:
             return JSONResponse({"detail": "Upload exceeds configured size limit"}, status_code=413)
-        response = await call_next(request)
+        uploading = request.url.path == "/v1/jobs/upload" and request.method == "POST"
+        reading_context = request.method == "GET" and request.url.path.startswith("/v1/jobs/") and request.url.path.endswith(("/result", "/context"))
+        slot = app.state.upload_slots if uploading else app.state.result_slots if reading_context else None
+        if slot and slot.locked():
+            return JSONResponse({"detail": "Request capacity reached; retry later"}, status_code=429)
+        if reading_context and memory_budget()["available_mb"] < 128:
+            return JSONResponse({"detail": "API memory pressure; retry later"}, status_code=503)
+        if uploading:
+            try:
+                check_disk(settings.data, int(raw_length) if raw_length.isdigit() else 0)
+            except ResourceExhausted as error:
+                return JSONResponse({"detail": str(error)}, status_code=507)
+        if slot:
+            await slot.acquire()
+        try:
+            response = await call_next(request)
+        finally:
+            if slot:
+                slot.release()
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Referrer-Policy"] = "same-origin"
         return response
@@ -180,6 +232,7 @@ def create_app(data_root=DATA, settings=None):
                 total = 0
                 with path.open("wb") as target:
                     while chunk := file.file.read(1024 * 1024):
+                        check_disk(path.parent, len(chunk))
                         total += len(chunk)
                         if total > settings.max_upload_bytes:
                             raise HTTPException(413, "Upload exceeds configured size limit")
@@ -190,6 +243,8 @@ def create_app(data_root=DATA, settings=None):
         except Exception as error:
             manager.db.update(record["id"], status="failed", stage="failed", finished_at=now(),
                               error=error.detail if isinstance(error, HTTPException) else str(error))
+            if isinstance(error, ResourceExhausted):
+                raise HTTPException(507, str(error)) from error
             raise
         finally:
             file.file.close()
