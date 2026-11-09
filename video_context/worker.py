@@ -49,14 +49,14 @@ class Worker:
         self.blocked_reason = None
         self.resource_error = None
 
-    def resources(self):
+    def resources(self, metrics=None):
         process = self.process
         payload = {"hostname": socket.gethostname(), "queues": self.queues, "device": WHISPER_DEVICE,
                 "model": WHISPER_MODEL, "job_id": self.current,
                 "memory_mb": round(process.memory_info().rss / 1024**2, 1),
                 "cpu_percent": process.cpu_percent(), "cpu_threads": process.num_threads(),
                 "heartbeat_at": time.time(), "stopping": self.stop_event.is_set()}
-        payload.update(self.guard.sample(), blocked_reason=self.blocked_reason,
+        payload.update(self.guard.sample() if metrics is None else metrics, blocked_reason=self.blocked_reason,
                        resource_domain=self.resource_domain, max_parallel=self.max_parallel)
         return payload
 
@@ -64,13 +64,14 @@ class Worker:
         while not self.heartbeat_stop.is_set():
             job_id = self.current
             try:
+                metrics = None
                 if job_id:
                     try:
-                        self.guard.check()
+                        metrics = self.guard.check()
                     except ResourceExhausted as error:
                         if self.current == job_id:
                             self.resource_error = error
-                self.db.heartbeat(self.id, self.resources(), job_id)
+                self.db.heartbeat(self.id, self.resources(metrics), job_id)
             except LeaseLost:
                 if self.current == job_id:
                     self.lost.set()
@@ -90,6 +91,20 @@ class Worker:
         if self.resource_error:
             raise self.resource_error
         self.guard.check(gpu=False)
+        if self.guard.device == "cuda" and stage.startswith("speech chunk "):
+            while True:
+                if self.lost.is_set():
+                    raise LeaseLost(job_id)
+                if self.resource_error:
+                    raise self.resource_error
+                metrics = self.guard.check()
+                if "gpu_memory_free_mb" in metrics and not metrics.get("gpu_telemetry_cached"):
+                    self.blocked_reason = None
+                    break
+                self.blocked_reason = "Waiting for a fresh GPU memory reading before the next speech window"
+                self.db.update(job_id, owner=self.id, stage="waiting for GPU telemetry")
+                if self.stop_event.wait(2):
+                    raise ResourceExhausted("Worker stopped while waiting for GPU telemetry")
         self.db.update(job_id, owner=self.id, stage=stage)
 
     def run_one(self):

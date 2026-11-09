@@ -63,7 +63,7 @@ def test_pressure_leaves_job_queued_without_consuming_attempt(tmp_path, monkeypa
     db.close()
 
 
-def test_runtime_gpu_telemetry_timeout_has_bounded_grace(tmp_path, monkeypatch):
+def test_runtime_gpu_telemetry_loss_warns_but_new_admission_still_waits(tmp_path, monkeypatch):
     guard = resources.ResourceGuard(tmp_path, "cuda")
     monkeypatch.setattr(resources, "memory_budget", lambda: {"available_mb": 4000, "limit_mb": 8192, "scope": "host"})
     monkeypatch.setattr(resources, "check_disk", lambda *args: None)
@@ -74,7 +74,37 @@ def test_runtime_gpu_telemetry_timeout_has_bounded_grace(tmp_path, monkeypatch):
     with pytest.raises(resources.ResourceExhausted, match="telemetry unavailable"):
         guard.check(starting=True)
     guard.last_gpu_at -= 11
+    assert "gpu_telemetry_warning" in guard.check()
     with pytest.raises(resources.ResourceExhausted, match="telemetry unavailable"):
+        guard.check(starting=True)
+
+
+def test_gpu_checkpoint_waits_for_fresh_telemetry_without_failing_job(tmp_path, monkeypatch):
+    updates = []
+    class DB:
+        def update(self, job_id, **values):
+            updates.append(values["stage"])
+    worker = Worker(DB(), None, tmp_path)
+    worker.guard.device = "cuda"
+    readings = iter([{"gpu_memory_free_mb": 4000, "gpu_telemetry_cached": True},
+                     {"gpu_telemetry_warning": "unavailable"},
+                     {"gpu_memory_free_mb": 4000, "gpu_telemetry_cached": False}])
+    monkeypatch.setattr(worker.guard, "check", lambda gpu=True, **kwargs: next(readings) if gpu else {})
+    monkeypatch.setattr(worker.stop_event, "wait", lambda seconds: False)
+    worker.progress("job", "speech chunk 120.0/300.0s")
+    assert updates == ["waiting for GPU telemetry", "waiting for GPU telemetry", "speech chunk 120.0/300.0s"]
+    assert worker.resource_error is None and worker.blocked_reason is None
+    # CPU OCR must continue even when GPU monitoring is absent.
+    worker.progress("job", "ocr 1/30")
+    assert updates[-1] == "ocr 1/30"
+
+
+def test_confirmed_gpu_pressure_still_fails(tmp_path, monkeypatch):
+    guard = resources.ResourceGuard(tmp_path, "cuda")
+    monkeypatch.setattr(resources, "memory_budget", lambda: {"available_mb": 4000, "limit_mb": 8192, "scope": "host"})
+    monkeypatch.setattr(resources, "check_disk", lambda *args: None)
+    monkeypatch.setattr(resources, "gpu_memory", lambda: {"gpu_memory_free_mb": 100, "gpu_memory_used_mb": 7900})
+    with pytest.raises(resources.ResourceExhausted, match="GPU pressure"):
         guard.check()
 
 

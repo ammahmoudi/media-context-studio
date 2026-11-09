@@ -36,12 +36,19 @@ def configure():
         "OMP_NUM_THREADS": value("VIDEO_CONTEXT_CPU_THREADS", "4"),
         "OPENBLAS_NUM_THREADS": value("VIDEO_CONTEXT_CPU_THREADS", "4"),
     }
-    for key, value in settings.items():
-        if value is not None:
-            os.environ.setdefault(key, value)
-    for key, configured in values.items():
-        if key.startswith("VIDEO_CONTEXT_"):
+    for key, configured in settings.items():
+        if configured is not None:
             os.environ.setdefault(key, configured)
+    for key, configured in values.items():
+        # .env describes the Docker CPU worker; do not replace the laptop's
+        # selected CUDA model/precision with the CPU profile's base/int8 values.
+        if key.startswith("VIDEO_CONTEXT_") and key not in {
+            "VIDEO_CONTEXT_WHISPER_MODEL", "VIDEO_CONTEXT_WHISPER_DEVICE", "VIDEO_CONTEXT_WHISPER_COMPUTE"}:
+            os.environ.setdefault(key, configured)
+    for suffix in ("MODEL", "DEVICE", "COMPUTE"):
+        native = value("VIDEO_CONTEXT_NATIVE_WHISPER_" + suffix)
+        if native is not None:
+            os.environ.setdefault("VIDEO_CONTEXT_WHISPER_" + suffix, native)
 
 
 if __name__ == "__main__":

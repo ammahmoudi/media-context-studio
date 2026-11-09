@@ -248,7 +248,7 @@ def transcribe(path, folder, source, options, progress=lambda stage: None):
                 core_end = min(audio_duration, core_start + chunk_seconds)
                 window_start = max(0, core_start - overlap)
                 window_end = min(audio_duration, core_end + overlap)
-                progress(f"speech {min(duration, core_start + offset):.1f}/{duration:.1f}s")
+                progress(f"speech chunk {min(duration, core_start + offset):.1f}/{duration:.1f}s")
                 audio_file.setpos(round(window_start * 16000))
                 samples = np.frombuffer(audio_file.readframes(round((window_end - window_start) * 16000)), dtype="<i2").astype(np.float32)
                 samples /= 32768.0  # in-place: no second float waveform

@@ -127,7 +127,12 @@ class ResourceGuard:
         check_disk(self.data)
         if self.device == "cuda" and gpu:
             if "gpu_memory_free_mb" not in values or starting and values.get("gpu_telemetry_cached"):
-                raise ResourceExhausted("GPU memory telemetry unavailable; refusing an unchecked GPU job")
+                if starting:
+                    raise ResourceExhausted("GPU memory telemetry unavailable; waiting before starting a GPU job")
+                # Loss of monitoring is not evidence of exhausted memory. CPU
+                # stages can continue; the next GPU window waits for fresh data.
+                values["gpu_telemetry_warning"] = "GPU telemetry unavailable; GPU work will wait at its next checkpoint"
+                return values
             required_gpu = (number("WARM_FREE_VRAM_MB", 768) if model_loaded else number("START_FREE_VRAM_MB", 3072)) if starting else number("MIN_FREE_VRAM_MB", 256)
             if values["gpu_memory_free_mb"] < required_gpu:
                 raise ResourceExhausted(f"GPU pressure: {values['gpu_memory_free_mb']:.0f} MiB free; {required_gpu:.0f} MiB required")
