@@ -1,126 +1,100 @@
 import json
 import math
 import re
+import secrets
 import shutil
-import threading
-import uuid
-from concurrent.futures import ThreadPoolExecutor
+import tempfile
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
 from pathlib import Path
+from typing import Literal
 
-from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.openapi.docs import get_swagger_ui_html
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.datastructures import Headers
+from pydantic import BaseModel, Field
 
-from .config import DATA, MODELS, WHISPER_COMPUTE, WHISPER_DEVICE, WHISPER_MODEL, prepare_dirs
+from .auth import issue_session, valid_session
+from .config import DATA, MODELS, WHISPER_COMPUTE, WHISPER_DEVICE, WHISPER_MODEL
+from .database import now
+from .jobs import Jobs
 from .models import AnalyzeRequest, Options
-from .pipeline import analyze, save_json
+from .pipeline import analyze
+from .settings import Settings
 
 
-def now():
-    return datetime.now(timezone.utc).isoformat()
+class Login(BaseModel):
+    api_key: str = Field(max_length=4096)
 
 
-class Jobs:
-    def __init__(self, root: Path):
-        self.root = root
-        root.mkdir(parents=True, exist_ok=True)
-        self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="video-context")
-        self.slots = threading.BoundedSemaphore(8)
-        self.lock = threading.Lock()
-        self.records = {}
-        for file in root.glob("*/job.json"):
-            try:
-                job = json.loads(file.read_text(encoding="utf-8"))
-                if job["status"] in {"queued", "running"}:
-                    job.update(status="failed", error="Service restarted before job completed", updated_at=now())
-                    save_json(file, job)
-                    context_file = file.parent / "context.json"
-                    if context_file.is_file():
-                        context = json.loads(context_file.read_text(encoding="utf-8"))
-                        context["status"] = "partial"
-                        context.setdefault("warnings", []).append(job["error"])
-                        save_json(context_file, context)
-                self.records[job["id"]] = job
-            except (ValueError, KeyError):
-                continue
-
-    def get(self, job_id):
-        with self.lock:
-            if job_id not in self.records:
-                raise HTTPException(404, "Unknown job ID")
-            return self.records[job_id].copy()
-
-    def update(self, job_id, **values):
-        with self.lock:
-            self.records[job_id].update(**values, updated_at=now())
-            save_json(self.root / job_id / "job.json", self.records[job_id])
-
-    def snapshot(self, limit, offset):
-        with self.lock:
-            records = [record.copy() for record in self.records.values()]
-        running = [r for r in records if r["status"] == "running"]
-        queued = [dict(r, queue_position=i) for i, r in enumerate(
-            (r for r in records if r["status"] == "queued"), 1)]
-        history = [r for r in records if r["status"] not in {"running", "queued"}]
-        history.sort(key=lambda r: datetime.fromisoformat(r["created_at"]).timestamp()
-                     if r.get("created_at") else 0, reverse=True)
-        return {"running": running, "queued": queued, "history": history[offset:offset + limit],
-                "total_history": len(history), "limit": limit, "offset": offset,
-                "counts": {status: sum(r["status"] == status for r in records)
-                           for status in ("running", "queued", "complete", "partial", "failed")},
-                "capacity": 8, "available_slots": max(0, 8 - len(running) - len(queued))}
-
-    def submit(self, path, options, job_id=None):
-        if not self.slots.acquire(blocking=False):
-            raise HTTPException(429, "Job queue is full; retry after a job finishes")
-        job_id = job_id or uuid.uuid4().hex
-        folder = self.root / job_id
-        folder.mkdir(exist_ok=True)
-        record = {"id": job_id, "status": "queued", "stage": "queued", "created_at": now(),
-                  "updated_at": now(), "source_file": path.name,
-                  "result_url": f"/v1/jobs/{job_id}/result", "options": options.model_dump()}
+class DashboardFiles(StaticFiles):
+    async def get_response(self, path, scope):
         try:
-            with self.lock:
-                self.records[job_id] = record
-                save_json(folder / "job.json", record)
-                # Keep visible queue order aligned with executor submission order.
-                self.executor.submit(self._work, job_id, path, options)
-        except Exception:
-            self.slots.release()
+            return await super().get_response(path, scope)
+        except StarletteHTTPException as error:
+            if error.status_code == 404 and "text/html" in Headers(scope=scope).get("accept", "") and "." not in path.rsplit("/", 1)[-1]:
+                return await super().get_response("index.html", scope)
             raise
-        return record.copy()
-
-    def _work(self, job_id, path, options):
-        try:
-            self.update(job_id, status="running", started_at=now())
-            result = analyze(path, self.root / job_id, options,
-                             lambda stage: self.update(job_id, stage=stage))
-            self.update(job_id, status=result["status"], stage="finished", elapsed_seconds=result["elapsed_seconds"], finished_at=now())
-        except Exception as error:
-            self.update(job_id, status="failed", stage="failed", error=str(error), finished_at=now())
-        finally:
-            self.slots.release()
 
 
-def create_app(data_root=DATA):
+def public_record(record):
+    return {**{k: v for k, v in record.items() if k not in ("legacy_dir", "input_key", "result_prefix")},
+            "video_available": bool(record.get("input_key"))}
+
+
+def create_app(data_root=DATA, settings=None):
+    settings = settings or Settings(data=data_root)
+
     @asynccontextmanager
     async def lifespan(app):
-        prepare_dirs()
-        app.state.jobs = Jobs(Path(data_root) / "jobs")
+        app.state.jobs = Jobs(settings, analyze)
         yield
-        app.state.jobs.executor.shutdown(wait=True)
+        app.state.jobs.close()
 
-    app = FastAPI(title="Local Video Context", version="0.1.0", lifespan=lifespan, docs_url=None,
-                  description="Local course video extraction. Submit a video, poll its job, retrieve timestamped evidence.")
-    # This local-file API is deliberately limited to local hostnames; no browser CORS access.
-    app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost", "[::1]", "testserver"])
+    app = FastAPI(title="Video Context", version="0.2.0", lifespan=lifespan, docs_url=None,
+                  description="Durable video extraction jobs, worker leases, private artifacts and video context.")
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=settings.allowed_hosts)
+    default_openapi = app.openapi
+
+    def openapi():
+        schema = default_openapi()
+        if settings.api_key:
+            schema.setdefault("components", {}).setdefault("securitySchemes", {})["ServiceKey"] = {
+                "type": "apiKey", "in": "header", "name": "X-API-Key"}
+            for path, operations in schema.get("paths", {}).items():
+                if path.startswith("/v1/"):
+                    for operation in operations.values():
+                        if isinstance(operation, dict):
+                            operation["security"] = [{"ServiceKey": []}]
+        return schema
+    app.openapi = openapi
+
+    @app.middleware("http")
+    async def access(request: Request, call_next):
+        protected = request.url.path.startswith("/v1/") or request.url.path in ("/docs", "/openapi.json", "/redoc")
+        origin = request.headers.get("origin")
+        # Cookie-authenticated writes must originate from this service. API-key
+        # clients are independent of browser cookies and can call server-to-server.
+        if request.method not in ("GET", "HEAD", "OPTIONS") and origin and origin.rstrip("/") != str(request.base_url).rstrip("/"):
+            return JSONResponse({"detail": "Cross-origin write rejected"}, status_code=403)
+        if protected and settings.api_key:
+            header = request.headers.get("x-api-key", "")
+            if not (secrets.compare_digest(header.encode(), settings.api_key.encode()) or
+                    valid_session(settings.api_key, request.cookies.get("video_session", ""))):
+                return JSONResponse({"detail": "Sign in with the service API key"}, status_code=401)
+        raw_length = request.headers.get("content-length", "0")
+        if raw_length.isdigit() and int(raw_length) > settings.max_upload_bytes + 2 * 1024**2:
+            return JSONResponse({"detail": "Upload exceeds configured size limit"}, status_code=413)
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Referrer-Policy"] = "same-origin"
+        return response
 
     static = Path(__file__).parent / "static"
-    app.mount("/ui", StaticFiles(directory=static, html=True, check_dir=False), name="dashboard")
+    app.mount("/ui", DashboardFiles(directory=static, html=True, check_dir=False), name="dashboard")
 
     @app.get("/", include_in_schema=False)
     def home():
@@ -129,90 +103,135 @@ def create_app(data_root=DATA):
     @app.get("/docs", include_in_schema=False)
     def swagger():
         return get_swagger_ui_html(openapi_url="/openapi.json", title="Video Context API · Swagger",
-                                   swagger_js_url="/ui/swagger/swagger-ui-bundle.js",
-                                   swagger_css_url="/ui/swagger/swagger-ui.css",
-                                   swagger_favicon_url="/ui/swagger/favicon-32x32.png")
+            swagger_js_url="/ui/swagger/swagger-ui-bundle.js", swagger_css_url="/ui/swagger/swagger-ui.css",
+            swagger_favicon_url="/ui/swagger/favicon-32x32.png", swagger_ui_parameters={"validatorUrl": None})
+
+    @app.post("/session", tags=["Access"])
+    def login(body: Login):
+        if settings.api_key and not secrets.compare_digest(body.api_key.encode(), settings.api_key.encode()):
+            raise HTTPException(401, "Invalid API key")
+        response = JSONResponse({"authenticated": True})
+        if settings.api_key:
+            response.set_cookie("video_session", issue_session(settings.api_key), httponly=True,
+                                secure=settings.secure_cookie, samesite="strict", max_age=43200)
+        return response
+
+    @app.delete("/session", tags=["Access"])
+    def logout():
+        response = JSONResponse({"authenticated": False})
+        response.delete_cookie("video_session")
+        return response
+
+    @app.get("/health", tags=["System"])
+    def health():
+        return {"status": "ok", "ffmpeg": bool(shutil.which("ffmpeg")), "ffprobe": bool(shutil.which("ffprobe")),
+                "speech": {"model": WHISPER_MODEL, "device": WHISPER_DEVICE, "compute_type": WHISPER_COMPUTE},
+                "prepared_ocr_profiles": sorted(p.stem for p in (MODELS / "ocr").glob("*.json")),
+                "auth_required": bool(settings.api_key), "allow_path": settings.allow_path,
+                "worker_mode": "embedded" if settings.embedded_worker else "external",
+                "database": app.state.jobs.db.engine.dialect.name, "storage": app.state.jobs.storage.kind}
+
+    @app.get("/ready", tags=["System"])
+    def ready():
+        try:
+            with app.state.jobs.db.engine.connect() as connection:
+                connection.exec_driver_sql("SELECT 1")
+            if app.state.jobs.storage.client:
+                app.state.jobs.storage.client.head_bucket(Bucket=settings.bucket)
+        except Exception:
+            raise HTTPException(503, "Database or object storage unavailable")
+        return {"status": "ready"}
 
     @app.get("/v1/jobs", tags=["Jobs"])
-    def list_jobs(limit: int = Query(20, ge=1, le=100), offset: int = Query(0, ge=0)):
-        """Live running jobs, FIFO queue positions, and paginated newest-first history."""
-        return app.state.jobs.snapshot(limit, offset)
+    def list_jobs(limit: int = Query(20, ge=1, le=100), offset: int = Query(0, ge=0),
+                  status: Literal["complete", "partial", "failed", "cancelled"] | None = None,
+                  search: str = Query("", max_length=200)):
+        result = app.state.jobs.db.snapshot(limit, offset, status, search)
+        result["storage"] = app.state.jobs.storage.kind
+        for key in ("running", "queued", "uploading", "history"):
+            result[key] = [public_record({k: v for k, v in r.items() if k != "artifacts"}) for r in result[key]]
+        return result
 
-    @app.get("/health")
-    def health():
-        return {"status": "ok", "ffmpeg": bool(shutil.which("ffmpeg")),
-                "ffprobe": bool(shutil.which("ffprobe")), "worker_count": 1,
-                "speech": {"model": WHISPER_MODEL, "device": WHISPER_DEVICE, "compute_type": WHISPER_COMPUTE},
-                "prepared_ocr_profiles": sorted(p.stem for p in (MODELS / "ocr").glob("*.json"))}
-
-    @app.post("/v1/jobs", status_code=202)
-    def submit(request: AnalyzeRequest):
-        path = Path(request.path).expanduser().resolve()
+    @app.post("/v1/jobs", status_code=202, tags=["Jobs"])
+    def submit(body: AnalyzeRequest):
+        if not settings.allow_path:
+            raise HTTPException(403, "Server-side paths are disabled; upload a video instead")
+        path = Path(body.path).expanduser().resolve()
         if not path.is_file():
             raise HTTPException(422, "Local video file does not exist")
-        return app.state.jobs.submit(path, request.options)
+        return public_record(app.state.jobs.submit(path, body.options, body.queue))
 
-    @app.post("/v1/jobs/upload", status_code=202)
-    def upload(file: UploadFile = File(...), options_json: str = Form("{}")):
+    @app.post("/v1/jobs/upload", status_code=202, tags=["Jobs"])
+    def upload(file: UploadFile = File(...), options_json: str = Form("{}"),
+               queue: Literal["default", "cpu", "gpu"] = Form("default")):
         try:
             options = Options.model_validate_json(options_json)
         except ValueError as error:
             raise HTTPException(422, str(error)) from error
-        job_id = uuid.uuid4().hex
-        folder = app.state.jobs.root / job_id
-        folder.mkdir()
-        # Keep the original filename only as a safe basename; never trust upload paths.
-        name = re.sub(r"[^\w. -]", "_", Path((file.filename or "video.mp4").replace("\\", "/")).name)
-        path = folder / ("input_" + name[:160])
+        name = Path((file.filename or "video.mp4").replace("\\", "/")).name[:160]
+        manager = app.state.jobs
+        record = manager.reserve(name, options, queue)
+        incoming = settings.data / "incoming"
+        incoming.mkdir(exist_ok=True)
         try:
-            total = 0
-            with path.open("wb") as target:
-                while chunk := file.file.read(1024 * 1024):
-                    total += len(chunk)
-                    if total > 8 * 1024**3:
-                        raise HTTPException(413, "Upload exceeds 8 GiB; use the local path endpoint")
-                    target.write(chunk)
-            if not total:
-                raise HTTPException(422, "Uploaded file is empty")
-            return app.state.jobs.submit(path, options, job_id=job_id)
-        except Exception:
-            path.unlink(missing_ok=True)
+            with tempfile.TemporaryDirectory(dir=incoming) as temporary:
+                suffix = Path(name).suffix.lower()
+                path = Path(temporary) / ("input" + (suffix if re.fullmatch(r"\.[a-z0-9]{1,10}", suffix) else ".bin"))
+                total = 0
+                with path.open("wb") as target:
+                    while chunk := file.file.read(1024 * 1024):
+                        total += len(chunk)
+                        if total > settings.max_upload_bytes:
+                            raise HTTPException(413, "Upload exceeds configured size limit")
+                        target.write(chunk)
+                if not total:
+                    raise HTTPException(422, "Uploaded file is empty")
+                return public_record(manager.ingest(path, record))
+        except Exception as error:
+            manager.db.update(record["id"], status="failed", stage="failed", finished_at=now(),
+                              error=error.detail if isinstance(error, HTTPException) else str(error))
             raise
         finally:
             file.file.close()
 
-    @app.get("/v1/jobs/{job_id}")
+    @app.get("/v1/jobs/{job_id}", tags=["Jobs"])
     def status(job_id: str):
-        return app.state.jobs.get(job_id)
+        return public_record(app.state.jobs.get(job_id))
 
-    @app.get("/v1/jobs/{job_id}/result")
+    @app.post("/v1/jobs/{job_id}/retry", status_code=202, tags=["Jobs"])
+    def retry(job_id: str):
+        return public_record(app.state.jobs.retry(app.state.jobs.get(job_id)))
+
+    @app.post("/v1/jobs/{job_id}/cancel", tags=["Jobs"])
+    def cancel(job_id: str):
+        app.state.jobs.get(job_id)
+        try:
+            return public_record(app.state.jobs.db.cancel(job_id))
+        except ValueError as error:
+            raise HTTPException(409, str(error)) from error
+
+    @app.get("/v1/jobs/{job_id}/result", tags=["Results"])
     def result(job_id: str):
-        job = app.state.jobs.get(job_id)
-        if job["status"] not in {"complete", "partial", "failed"}:
-            raise HTTPException(409, "Job is not finished; poll the status endpoint")
-        file = app.state.jobs.root / job_id / "context.json"
-        if not file.is_file():
-            raise HTTPException(409, job.get("error", "No context was produced"))
-        return FileResponse(file, media_type="application/json")
+        record = app.state.jobs.get(job_id)
+        if record["status"] not in ("complete", "partial", "failed", "cancelled"):
+            raise HTTPException(409, "Job is not finished; poll its status")
+        return app.state.jobs.context(record)
 
-    @app.get("/v1/jobs/{job_id}/artifacts/{artifact:path}")
-    def artifact(job_id: str, artifact: str):
-        app.state.jobs.get(job_id)
-        folder = (app.state.jobs.root / job_id).resolve()
-        path = (folder / artifact).resolve()
-        allowed = (artifact in {"context.json", "context.md", "captions/speech.srt"}
-                   or (artifact.startswith("frames/") and path.suffix == ".jpg"))
-        if not path.is_relative_to(folder) or not allowed or not path.is_file():
-            raise HTTPException(404, "Unknown artifact")
-        return FileResponse(path)
+    @app.get("/v1/jobs/{job_id}/video", tags=["Results"])
+    @app.head("/v1/jobs/{job_id}/video", include_in_schema=False)
+    def video(job_id: str, request: Request):
+        record = app.state.jobs.get(job_id)
+        if not record.get("input_key"):
+            raise HTTPException(404, "Video is unavailable; import the original video or submit a new job")
+        return app.state.jobs.storage.response(record["input_key"], request)
 
-    @app.get("/v1/jobs/{job_id}/context")
+    @app.get("/v1/jobs/{job_id}/artifacts/{artifact:path}", tags=["Results"])
+    def artifact(job_id: str, artifact: str, request: Request):
+        return app.state.jobs.artifact(app.state.jobs.get(job_id), artifact, request)
+
+    @app.get("/v1/jobs/{job_id}/context", tags=["Results"])
     def interval(job_id: str, start: float = 0, end: float | None = None):
-        app.state.jobs.get(job_id)
-        file = app.state.jobs.root / job_id / "context.json"
-        if not file.is_file():
-            raise HTTPException(409, "Context is not available yet")
-        context = json.loads(file.read_text(encoding="utf-8"))
+        context = app.state.jobs.context(app.state.jobs.get(job_id))
         end = end if end is not None else context["source"]["duration_seconds"]
         if start < 0 or end <= start or not all(map(math.isfinite, (start, end))):
             raise HTTPException(422, "Expected finite times with 0 <= start < end")
@@ -223,7 +242,6 @@ def create_app(data_root=DATA):
                 "frames": frames,
                 "on_screen_text": [t for t in context["on_screen_text"] if ids.intersection(t.get("frame_ids", [t["frame_id"]]))],
                 "speech_segments": [s for s in context["speech_segments"] if s["start_seconds"] < end and s["end_seconds"] > start]}
-
     return app
 
 

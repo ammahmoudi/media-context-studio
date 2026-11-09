@@ -2,6 +2,7 @@ import hashlib
 import importlib.metadata
 import json
 import math
+import os
 import subprocess
 import time
 import wave
@@ -167,7 +168,7 @@ def speech_model(download=False):
 
     return WhisperModel(WHISPER_MODEL, device=WHISPER_DEVICE, compute_type=WHISPER_COMPUTE,
                         download_root=str(MODELS / "whisper"), local_files_only=not download,
-                        cpu_threads=4)
+                        cpu_threads=int(os.getenv("VIDEO_CONTEXT_CPU_THREADS", "4")))
 
 
 @lru_cache(maxsize=1)
@@ -178,13 +179,18 @@ def ocr_model(language="en"):
     if not manifest.is_file():
         raise FileNotFoundError(f"OCR models are not prepared for {language}. Run prepare-models --ocr-language {language}")
     models = json.loads(manifest.read_text(encoding="utf-8"))
+    # Model manifests are portable across Windows laptop and Linux containers.
+    for model in models.values():
+        portable = MODELS / "ocr" / model["name"]
+        if portable.is_dir():
+            model["path"] = str(portable)
     return PaddleOCR(text_detection_model_name=models["detector"]["name"],
                      text_detection_model_dir=models["detector"]["path"],
                      text_recognition_model_name=models["recognizer"]["name"],
                      text_recognition_model_dir=models["recognizer"]["path"],
                      device="cpu", use_doc_orientation_classify=False,
                      use_doc_unwarping=False, use_textline_orientation=False,
-                     enable_mkldnn=False, cpu_threads=4)
+                     enable_mkldnn=False, cpu_threads=int(os.getenv("VIDEO_CONTEXT_CPU_THREADS", "4")))
 
 
 def prepare_ocr(language):

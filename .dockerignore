@@ -1,0 +1,14 @@
+.git
+.venv
+.uv-cache
+.models
+data
+.env
+.env.*
+config.local.json
+web/node_modules
+web/.git
+**/__pycache__
+.pytest_cache
+*.egg-info
+*.log

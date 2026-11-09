@@ -18,6 +18,7 @@ class AnalyzeRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     path: str = Field(min_length=1)
     options: Options = Field(default_factory=Options)
+    queue: Literal["default", "cpu", "gpu"] = "default"
 
 
-JobStatus = Literal["queued", "running", "complete", "partial", "failed"]
+JobStatus = Literal["uploading", "queued", "running", "complete", "partial", "failed", "cancelled"]

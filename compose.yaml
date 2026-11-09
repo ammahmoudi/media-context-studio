@@ -1,0 +1,132 @@
+name: video-context
+
+x-environment: &environment
+  VIDEO_CONTEXT_DATABASE_URL: postgresql+psycopg://video:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/video
+  VIDEO_CONTEXT_S3_ENDPOINT: ${VIDEO_CONTEXT_S3_ENDPOINT:-http://object-store:9000}
+  VIDEO_CONTEXT_S3_BUCKET: ${VIDEO_CONTEXT_S3_BUCKET:-video-context}
+  AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY:?Set S3_ACCESS_KEY in .env}
+  AWS_SECRET_ACCESS_KEY: ${S3_SECRET_KEY:?Set S3_SECRET_KEY in .env}
+  AWS_DEFAULT_REGION: us-east-1
+  VIDEO_CONTEXT_EMBEDDED_WORKER: "0"
+  VIDEO_CONTEXT_DATA: /data
+  VIDEO_CONTEXT_MODELS: /models
+  VIDEO_CONTEXT_QUEUE_CAPACITY: ${VIDEO_CONTEXT_QUEUE_CAPACITY:-32}
+  VIDEO_CONTEXT_WHISPER_MODEL: ${VIDEO_CONTEXT_WHISPER_MODEL:-base}
+  VIDEO_CONTEXT_WHISPER_DEVICE: cpu
+  VIDEO_CONTEXT_WHISPER_COMPUTE: int8
+  VIDEO_CONTEXT_CPU_THREADS: ${VIDEO_CONTEXT_CPU_THREADS:-4}
+  OMP_NUM_THREADS: ${VIDEO_CONTEXT_CPU_THREADS:-4}
+  OPENBLAS_NUM_THREADS: ${VIDEO_CONTEXT_CPU_THREADS:-4}
+  VIDEO_CONTEXT_API_KEY: ${VIDEO_CONTEXT_API_KEY:?Set VIDEO_CONTEXT_API_KEY in .env}
+  VIDEO_CONTEXT_ALLOWED_HOSTS: ${VIDEO_CONTEXT_ALLOWED_HOSTS:-127.0.0.1,localhost,api}
+  VIDEO_CONTEXT_ALLOW_PATH: "0"
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: video
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: video
+    volumes: ["postgres-data:/var/lib/postgresql/data"]
+    ports: ["127.0.0.1:${VIDEO_CONTEXT_DB_PORT:-55433}:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U video -d video"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+    mem_limit: 1g
+
+  object-store:
+    image: rustfs/rustfs:1.0.4
+    environment:
+      RUSTFS_ACCESS_KEY: ${S3_ACCESS_KEY:?Set S3_ACCESS_KEY in .env}
+      RUSTFS_SECRET_KEY: ${S3_SECRET_KEY:?Set S3_SECRET_KEY in .env}
+      RUSTFS_VOLUMES: /data
+      RUSTFS_ADDRESS: 0.0.0.0:9000
+      RUSTFS_CONSOLE_ADDRESS: 0.0.0.0:9001
+      RUSTFS_CONSOLE_ENABLE: "true"
+    ports:
+      - "127.0.0.1:${VIDEO_CONTEXT_S3_PORT:-19020}:9000"
+      - "127.0.0.1:${VIDEO_CONTEXT_CONSOLE_PORT:-19021}:9001"
+    volumes: ["object-data:/data"]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9000/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 15s
+    restart: unless-stopped
+    mem_limit: 2g
+
+  init:
+    image: video-context-api:local
+    build: {context: ., target: api}
+    environment: *environment
+    command: ["python", "-m", "video_context.cli", "db-init"]
+    depends_on:
+      postgres: {condition: service_healthy}
+      object-store: {condition: service_healthy}
+    restart: "no"
+
+  api:
+    image: video-context-api:local
+    build: {context: ., target: api}
+    environment: *environment
+    depends_on:
+      init: {condition: service_completed_successfully}
+    ports: ["127.0.0.1:${VIDEO_CONTEXT_HTTP_PORT:-18765}:18765"]
+    volumes: ["api-scratch:/data", "${VIDEO_CONTEXT_MODELS_VOLUME:-model-cache}:/models:ro"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:18765/ready')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    mem_limit: 1g
+    security_opt: ["no-new-privileges:true"]
+
+  worker:
+    image: video-context-worker:local
+    build: {context: ., target: worker}
+    environment:
+      <<: *environment
+      VIDEO_CONTEXT_WORKER_QUEUES: default,cpu
+    depends_on:
+      init: {condition: service_completed_successfully}
+    volumes: ["worker-scratch:/data", "${VIDEO_CONTEXT_MODELS_VOLUME:-model-cache}:/models"]
+    restart: unless-stopped
+    stop_grace_period: 90s
+    mem_limit: 6g
+    cpus: ${VIDEO_CONTEXT_CPU_THREADS:-4}
+    security_opt: ["no-new-privileges:true"]
+
+  gpu-worker:
+    profiles: ["gpu"]
+    image: video-context-gpu-worker:local
+    build: {context: ., target: gpu}
+    environment:
+      <<: *environment
+      VIDEO_CONTEXT_WHISPER_MODEL: large-v3-turbo
+      VIDEO_CONTEXT_WHISPER_DEVICE: cuda
+      VIDEO_CONTEXT_WHISPER_COMPUTE: int8_float16
+      VIDEO_CONTEXT_WORKER_QUEUES: gpu
+    depends_on:
+      init: {condition: service_completed_successfully}
+    volumes: ["gpu-scratch:/data", "${VIDEO_CONTEXT_MODELS_VOLUME:-model-cache}:/models"]
+    deploy:
+      resources:
+        reservations:
+          devices: [{driver: nvidia, count: 1, capabilities: [gpu]}]
+    restart: unless-stopped
+    stop_grace_period: 90s
+    mem_limit: 6g
+
+volumes:
+  model-cache:
+  postgres-data:
+  object-data:
+  api-scratch:
+  worker-scratch:
+  gpu-scratch:

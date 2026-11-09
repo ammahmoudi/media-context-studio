@@ -2,6 +2,14 @@
 	"version": "2.0.0",
 	"tasks": [
 		{
+			"label": "Run production GPU worker",
+			"type": "shell",
+			"command": "${workspaceFolder}/.venv/Scripts/python.exe",
+			"args": ["scripts/with_stack.py", "worker", "--queues", "gpu"],
+			"isBackground": true,
+			"problemMatcher": []
+		},
+		{
 			"label": "Run local video context service",
 			"type": "shell",
 			"command": "${workspaceFolder}/.venv/Scripts/python.exe",
@@ -25,6 +33,19 @@
 			"isBackground": false,
 			"problemMatcher": [],
 			"group": "build"
+		},
+		{
+			"label": "Run GPU worker for Docker stack",
+			"type": "shell",
+			"command": "${workspaceFolder}/.venv/Scripts/python.exe",
+			"args": [
+				"scripts/with_stack.py",
+				"worker",
+				"--queues",
+				"gpu"
+			],
+			"isBackground": true,
+			"problemMatcher": []
 		}
 	]
 }
