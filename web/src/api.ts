@@ -9,6 +9,14 @@ export type Job = {
 	elapsed_seconds?: number;
 	error?: string;
 	queue_position?: number;
+	queue?: string;
+	worker_id?: string;
+	attempt?: number;
+	video_available?: boolean;
+	input_bytes?: number;
+	finished_at?: string;
+	source?: { duration_seconds: number; width: number; height: number };
+	artifacts?: { path: string; bytes: number }[];
 };
 export type Snapshot = {
 	running: Job[];
@@ -18,11 +26,37 @@ export type Snapshot = {
 	counts: Record<string, number>;
 	capacity: number;
 	available_slots: number;
+	uploading: Job[];
+	workers: Worker[];
+	database: string;
+	storage: string;
+};
+export type Worker = {
+	id: string;
+	online: boolean;
+	hostname: string;
+	queues: string[];
+	device: string;
+	model: string;
+	job_id?: string;
+	memory_mb: number;
+	cpu_percent: number;
+	cpu_threads: number;
+	gpu_memory_used_mb?: number;
+	gpu_memory_total_mb?: number;
+	gpu_utilization_percent?: number;
+	last_seen_seconds_ago: number;
+	stopping: boolean;
 };
 export type Health = {
 	status: string;
 	speech: { model: string; device: string };
 	prepared_ocr_profiles: string[];
+	auth_required: boolean;
+	allow_path: boolean;
+	worker_mode: string;
+	database: string;
+	storage: string;
 };
 export type Frame = { id: string; path: string; timestamp_seconds: number };
 export type Context = {
@@ -40,9 +74,17 @@ export type Context = {
 		start_seconds: number;
 		end_seconds: number;
 		text: string;
+		language?: string;
 	}[];
 	on_screen_text: { id: string; text: string; frame_ids?: string[] }[];
 };
+export class ApiError extends Error {
+	status: number;
+	constructor(message: string, status: number) {
+		super(message);
+		this.status = status;
+	}
+}
 export async function request<T>(url: string, init?: RequestInit): Promise<T> {
 	const response = await fetch(url, init);
 	if (!response.ok) {
@@ -56,7 +98,7 @@ export async function request<T>(url: string, init?: RequestInit): Promise<T> {
 		} catch {
 			/* Preserve HTTP error if the response isn't JSON. */
 		}
-		throw new Error(message);
+		throw new ApiError(message, response.status);
 	}
 	return response.json();
 }

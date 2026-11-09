@@ -1,5 +1,7 @@
 # Local dashboard
 
+The current studio has dedicated Overview, Runs, Workers, New Run, and full run-detail pages, plus video playback with WebVTT captions derived from the saved SRT/transcript. The deployed service now uses PostgreSQL/S3 and authenticated sessions. See [current deployment and migration](./production.md); the original single-page workflow below is retained as initial validation history.
+
 Open <http://127.0.0.1:18765/> to use the dashboard. Swagger is at <http://127.0.0.1:18765/docs>. The API serves both; there is no separate frontend server to start for normal use. The existing **Run local video context service** task starts everything.
 
 To inspect the full course result directly, open <http://127.0.0.1:18765/ui/?job=0231b5bb002148dba9f3ccc9a333b38f>.
