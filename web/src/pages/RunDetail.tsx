@@ -16,6 +16,7 @@ import type { Context, Job } from "../api";
 import { Link, Pager, Stage, Status } from "../components/common";
 import { active, date, runPath } from "../navigation";
 import type { Navigate } from "../navigation";
+import RunExport from "../components/RunExport";
 
 const bytes = (n?: number) =>
 	n == null
@@ -38,6 +39,7 @@ export default function RunDetail({
 		[framePage, setFramePage] = useState(0);
 	const [windowResult, setWindowResult] = useState<Context | null>(null);
 	const [videoError, setVideoError] = useState(false);
+	const [exportOpen, setExportOpen] = useState(false);
 	const job = useQuery({
 		queryKey: ["job", id],
 		queryFn: () => request<Job>(`/v1/jobs/${id}`),
@@ -110,6 +112,9 @@ export default function RunDetail({
 					</div>
 				</div>
 				<div className="detail-actions">
+					{(r?.video_available || !!r?.artifacts?.length) && <Button variant="outline" onClick={() => setExportOpen(!exportOpen)} aria-expanded={exportOpen}>
+						<Download size={14} /> Download files
+					</Button>}
 					{["queued", "running"].includes(r!.status) && (
 						<Button
 							variant="outline"
@@ -148,6 +153,7 @@ export default function RunDetail({
 					)}
 				</div>
 			</div>
+			{exportOpen && <RunExport key={id} id={id} />}
 			{(r?.error || action.isError) && (
 				<div role="alert" className="error">
 					{action.error?.message ?? r?.error}

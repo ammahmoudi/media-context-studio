@@ -4,6 +4,9 @@ VIDEO_CONTEXT_INTEGRATION=1 python -m pytest tests/test_integration.py
 Every test owns a temporary database and bucket; normal service data is untouched.
 """
 import os
+import io
+import json
+import zipfile
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -109,5 +112,15 @@ def test_independent_worker_s3_artifacts_and_ranged_video(stack, video):
         assert response.status_code == 206 and response.content == data[-8:]
         assert client.head(base).headers["content-length"] == str(len(data))
         assert client.get(base, headers={"range": "bytes=99999999-"}).status_code == 416
+        export_base = f"/v1/jobs/{job['id']}/exports"
+        catalog = client.get(export_base).json()
+        selected = ["context.json", context["frames"][0]["path"], "source/video.mp4"]
+        assert set(selected) <= {item["path"] for item in catalog["files"]}
+        response = client.post(export_base + "/download", data={"files_json": json.dumps(selected)})
+        assert response.status_code == 200
+        with zipfile.ZipFile(io.BytesIO(response.content)) as output:
+            assert set(output.namelist()) == set(selected) | {"export-manifest.json"}
+            assert output.read("source/video.mp4") == data
+            assert json.loads(output.read("context.json"))["source"]["file_name"] == "lecture.mp4"
     with TestClient(create_app(settings=settings)) as client:
         assert client.get(f"/v1/jobs/{job['id']}/result").status_code == 200

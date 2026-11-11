@@ -210,3 +210,19 @@ Preference: established upstream components with substantial adoption and recent
 | [EasyOCR](https://github.com/JaidedAI/EasyOCR) | 30,130 | December 5, 2025 | Evaluated; PaddleOCR preferred for more recent activity |
 
 FastAPI provides the HTTP interface. OpenMontage remains a production-workflow reference rather than an installed dependency. Qwen3-VL remains optional future visual enrichment; a large visual model is not needed for the first extraction service.
+
+## Download a run
+
+Open a run in the dashboard and select **Download files**. Choose **Results only**, **All files** (including the original video), groups such as captions or frames, or individual files. ZIP and TAR.GZ are available. Results are selected by default; the source video is optional. Only published artifacts are listed, so active processing may not have downloadable results yet.
+
+Every archive contains `export-manifest.json` with the run ID, status, source file name, and selected paths and sizes. It does not expose storage keys, credentials, or worker scratch paths. Existing individual file downloads remain available.
+
+Authenticated API routes, also shown in Swagger at `/docs`:
+
+- `GET /v1/jobs/{id}/exports`: available paths, byte sizes, file groups, and formats.
+- `GET /v1/jobs/{id}/exports/download?format=zip`: all available files and the original video. Use `format=tar.gz` for TAR.GZ. Repeated `files` query parameters select specific catalog paths.
+- `POST /v1/jobs/{id}/exports/download`: form fields `format` and `files_json`. The latter is a JSON array of catalog paths; `null` selects all files. This supports large frame selections without exceeding URL limits.
+
+For example, submit form data `format=zip` and `files_json=["context.json","captions/speech.srt"]` to export the structured context and subtitles. Use the existing API key header or dashboard login session.
+
+Downloads stream from local/S3 storage in bounded 256 KiB input chunks; no complete archive is held in RAM or written to scratch storage. One archive may stream per API process; concurrent requests receive HTTP 429. Disconnects close source streams and release the export slot. `VIDEO_CONTEXT_MAX_EXPORT_BYTES` limits selected uncompressed bytes (16 GiB default), with at most 4,096 selected files. ZIP avoids recompressing JPEG/video; TAR.GZ compresses the entire stream. Archives are generated on demand and do not support HTTP Range resume; restart an interrupted download. A missing storage object during streaming terminates the download rather than producing a complete archive.

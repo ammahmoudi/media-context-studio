@@ -5,6 +5,7 @@ import re
 import secrets
 import shutil
 import tempfile
+import anyio
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal
@@ -12,7 +13,8 @@ from typing import Literal
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.openapi.docs import get_swagger_ui_html
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
+from starlette.concurrency import run_in_threadpool
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.datastructures import Headers
@@ -26,6 +28,24 @@ from .models import AnalyzeRequest, Options
 from .pipeline import analyze
 from .settings import Settings
 from .resources import ResourceExhausted, check_disk, memory_budget
+from . import exports
+
+
+class ExportResponse(StreamingResponse):
+    """Close source streams and release capacity even when a client disconnects."""
+    def __init__(self, iterator, release, **kwargs):
+        self.iterator, self.release = iterator, release
+        super().__init__(iterator, **kwargs)
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            with anyio.CancelScope(shield=True):
+                try:
+                    await run_in_threadpool(self.iterator.close)
+                finally:
+                    self.release()
 
 
 class Login(BaseModel):
@@ -84,6 +104,7 @@ def create_app(data_root=DATA, settings=None):
         app.state.jobs = Jobs(settings, analyze)
         app.state.upload_slots = asyncio.BoundedSemaphore(2)
         app.state.result_slots = asyncio.BoundedSemaphore(1)
+        app.state.export_slots = asyncio.BoundedSemaphore(1)
         yield
         app.state.jobs.close()
 
@@ -283,6 +304,50 @@ def create_app(data_root=DATA, settings=None):
     @app.get("/v1/jobs/{job_id}/artifacts/{artifact:path}", tags=["Results"])
     def artifact(job_id: str, artifact: str, request: Request):
         return app.state.jobs.artifact(app.state.jobs.get(job_id), artifact, request)
+
+    @app.get("/v1/jobs/{job_id}/exports", tags=["Downloads"])
+    def export_catalog(job_id: str):
+        manager = app.state.jobs
+        entries = exports.catalog(manager, manager.get(job_id))
+        return {"formats": ["zip", "tar.gz"], "files": [
+            {key: entry[key] for key in ("path", "bytes", "kind")} for entry in entries]}
+
+    async def download_export(job_id, format, paths):
+        slots = app.state.export_slots
+        if slots.locked():
+            raise HTTPException(429, "Another export is streaming; retry when it finishes")
+        if memory_budget()["available_mb"] < 128:
+            raise HTTPException(503, "API memory pressure; retry later")
+        await slots.acquire()
+        try:
+            manager = app.state.jobs
+            record = await run_in_threadpool(manager.get, job_id)
+            entries = await run_in_threadpool(exports.catalog, manager, record)
+            selected = exports.select(entries, paths)
+            iterator = exports.archive(manager.storage, record, selected, format)
+            return ExportResponse(iterator, slots.release,
+                media_type="application/zip" if format == "zip" else "application/gzip",
+                headers={"Content-Disposition": f'attachment; filename="run-{record["id"]}.{format}"',
+                         "Cache-Control": "private, no-store", "X-Accel-Buffering": "no"})
+        except BaseException:
+            slots.release()
+            raise
+
+    @app.get("/v1/jobs/{job_id}/exports/download", tags=["Downloads"], response_class=StreamingResponse)
+    async def download_all(job_id: str, format: Literal["zip", "tar.gz"] = "zip",
+                           files: list[str] | None = Query(None, max_length=4096)):
+        """Download all published files and source video, or repeated selected files parameters."""
+        return await download_export(job_id, format, files)
+
+    @app.post("/v1/jobs/{job_id}/exports/download", tags=["Downloads"], response_class=StreamingResponse)
+    async def download_selected(job_id: str, format: Literal["zip", "tar.gz"] = Form("zip"),
+                                files_json: str = Form("null", max_length=512000)):
+        """Browser/agent download. files_json is a JSON array of catalog paths; null selects all."""
+        try:
+            paths = json.loads(files_json)
+        except ValueError as error:
+            raise HTTPException(422, "files_json must be a JSON array or null") from error
+        return await download_export(job_id, format, paths)
 
     @app.get("/v1/jobs/{job_id}/context", tags=["Results"])
     def interval(job_id: str, start: float = 0, end: float | None = None):
