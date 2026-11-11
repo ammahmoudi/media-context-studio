@@ -139,6 +139,48 @@ def test_confirmed_gpu_pressure_still_fails(tmp_path, monkeypatch):
         guard.check()
 
 
+def test_past_pressure_spike_does_not_fail_a_recovered_checkpoint(tmp_path, monkeypatch):
+    updates = []
+    db = SimpleNamespace(update=lambda job_id, **values: updates.append(values["stage"]))
+    worker = Worker(db, None, tmp_path)
+    worker.resource_error = resources.ResourceExhausted("earlier RAM pressure")
+    monkeypatch.setattr(worker.guard, "check", lambda **kwargs: {})
+    worker.progress("job", "frames")
+    assert updates == ["frames"]
+    assert worker.resource_error is None
+
+
+def test_live_pressure_pauses_then_resumes_without_failing_job(tmp_path, monkeypatch):
+    updates = []
+    db = SimpleNamespace(update=lambda job_id, **values: updates.append(values["stage"]))
+    worker = Worker(db, None, tmp_path)
+    calls = []
+    def check(**kwargs):
+        calls.append(True)
+        if len(calls) < 3:
+            raise resources.ResourceExhausted("RAM pressure")
+        return {}
+    monkeypatch.setattr(worker.guard, "check", check)
+    monkeypatch.setattr(worker.stop_event, "wait", lambda seconds: False)
+    worker.progress("job", "ocr 2/20")
+    assert updates == ["waiting for resources: ocr 2/20", "waiting for resources: ocr 2/20", "ocr 2/20"]
+    assert worker.resource_error is None and worker.blocked_reason is None
+
+
+def test_cancellation_still_interrupts_a_resource_wait(tmp_path, monkeypatch):
+    db = SimpleNamespace(update=lambda *args, **kwargs: None)
+    worker = Worker(db, None, tmp_path)
+    def pressure(**kwargs):
+        raise resources.ResourceExhausted("RAM pressure")
+    def cancelled(seconds):
+        worker.lost.set()
+        return False
+    monkeypatch.setattr(worker.guard, "check", pressure)
+    monkeypatch.setattr(worker.stop_event, "wait", cancelled)
+    with pytest.raises(LeaseLost):
+        worker.progress("job", "frames")
+
+
 def test_allocation_failure_marks_job_failed_with_peak_evidence(tmp_path, monkeypatch):
     db = Database("sqlite:///" + (tmp_path / "jobs.db").as_posix())
     db.reserve(dict(record("oom"), input_key="source", input_bytes=10))

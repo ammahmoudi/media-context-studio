@@ -68,6 +68,8 @@ class Worker:
                 if job_id:
                     try:
                         metrics = self.guard.check()
+                        if self.current == job_id:
+                            self.resource_error = None
                     except ResourceExhausted as error:
                         if self.current == job_id:
                             self.resource_error = error
@@ -85,19 +87,30 @@ class Worker:
                 log.exception("Worker heartbeat failed")
             self.heartbeat_stop.wait(min(2, self.db.lease_seconds / 4))
 
+    def wait_for_resources(self, job_id, stage, gpu=False):
+        """Recheck live pressure at a checkpoint; never latch an old spike."""
+        while True:
+            if self.lost.is_set():
+                raise LeaseLost(job_id)
+            try:
+                metrics = self.guard.check(gpu=gpu)
+                self.resource_error = None
+                self.blocked_reason = None
+                return metrics
+            except ResourceExhausted as error:
+                self.resource_error = error
+                self.blocked_reason = str(error)
+                self.db.update(job_id, owner=self.id, stage="waiting for resources: " + stage)
+                if self.stop_event.wait(2):
+                    raise ResourceExhausted("Worker stopped while waiting for resources") from error
+
     def progress(self, job_id, stage):
-        if self.lost.is_set():
-            raise LeaseLost(job_id)
-        if self.resource_error:
-            raise self.resource_error
-        self.guard.check(gpu=False)
+        self.wait_for_resources(job_id, stage)
         if self.guard.device == "cuda" and stage.startswith("speech chunk "):
             while True:
                 if self.lost.is_set():
                     raise LeaseLost(job_id)
-                if self.resource_error:
-                    raise self.resource_error
-                metrics = self.guard.check()
+                metrics = self.wait_for_resources(job_id, stage, gpu=True)
                 if "gpu_memory_free_mb" in metrics and not metrics.get("gpu_telemetry_cached"):
                     self.blocked_reason = None
                     break
