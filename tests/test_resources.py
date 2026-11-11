@@ -63,6 +63,37 @@ def test_pressure_leaves_job_queued_without_consuming_attempt(tmp_path, monkeypa
     db.close()
 
 
+def test_disk_reservation_waits_before_claiming_without_using_attempt(tmp_path, monkeypatch):
+    from video_context import worker as worker_module
+    db = Database("sqlite:///" + (tmp_path / "jobs.db").as_posix())
+    db.reserve(dict(record("disk-wait"), input_bytes=500 * resources.MIB))
+    worker = Worker(db, None, tmp_path)
+    monkeypatch.setattr(worker.guard, "check", lambda **kwargs: {})
+    requested = []
+    def no_capacity(path, extra=0):
+        requested.append(extra)
+        raise resources.ResourceExhausted("Scratch disk needs more space")
+    monkeypatch.setattr(worker_module, "check_disk", no_capacity)
+    assert not worker.run_one()
+    assert requested[0] > 1000 * resources.MIB  # input, decoded audio, frames
+    assert db.get("disk-wait")["status"] == "queued"
+    assert "Scratch disk" in worker.blocked_reason
+    assert db.claim("manual", ["default"])["attempt"] == 1
+    db.close()
+
+
+def test_peek_race_does_not_claim_a_different_unbudgeted_record(tmp_path):
+    db = Database("sqlite:///" + (tmp_path / "jobs.db").as_posix())
+    db.reserve(record("small"))
+    db.reserve(record("large"))
+    assert db.peek(["default"])["id"] == "small"
+    assert db.claim("other", ["default"])["id"] == "small"
+    assert db.claim("ours", ["default"], expected_id="small") is None
+    assert db.get("large")["status"] == "queued"
+    assert db.claim("ours", ["default"], expected_id="large")["attempt"] == 1
+    db.close()
+
+
 def test_runtime_gpu_telemetry_loss_warns_but_new_admission_still_waits(tmp_path, monkeypatch):
     guard = resources.ResourceGuard(tmp_path, "cuda")
     monkeypatch.setattr(resources, "memory_budget", lambda: {"available_mb": 4000, "limit_mb": 8192, "scope": "host"})

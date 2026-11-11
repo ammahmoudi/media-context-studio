@@ -98,7 +98,13 @@ class Database:
             conn.execute(update(jobs).where(jobs.c.id == job_id).values(**fields))
             return data
 
-    def claim(self, owner, queues, resource_domain=None, max_parallel=1, fail_on_worker_loss=False, admit=True):
+    def peek(self, queues):
+        """Read the FIFO candidate without starting it or consuming an attempt."""
+        with self.engine.connect() as conn:
+            return conn.execute(select(jobs.c.data).where(jobs.c.status == "queued", jobs.c.queue.in_(queues))
+                .order_by(jobs.c.created, jobs.c.id).limit(1)).scalar_one_or_none()
+
+    def claim(self, owner, queues, resource_domain=None, max_parallel=1, fail_on_worker_loss=False, admit=True, expected_id=None):
         # Serialize admission across replicas; the queue remains durable while a
         # host/GPU's shared inference slots are occupied.
         with self.transaction(serialize=True) as conn:
@@ -134,6 +140,8 @@ class Database:
             row = conn.execute(select(jobs).where(jobs.c.status == "queued", jobs.c.queue.in_(queues))
                 .order_by(jobs.c.created, jobs.c.id).limit(1).with_for_update(skip_locked=True)).mappings().first()
             if row is None:
+                return None
+            if expected_id is not None and row["id"] != expected_id:
                 return None
             attempt = row["attempt"] + 1
             data = dict(row["data"], status="running", stage="starting", started_at=now(),

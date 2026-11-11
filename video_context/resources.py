@@ -66,6 +66,14 @@ def check_disk(path, extra_bytes=0):
         raise ResourceExhausted(f"Scratch disk needs {required / MIB:.0f} MiB free; {free / MIB:.0f} MiB available")
 
 
+def scratch_bytes(record):
+    """Conservative whole-attempt estimate before the recording is inspected."""
+    options = record.get("options", {})
+    audio = number("MAX_DURATION_SECONDS", 21600, 1) * 32000 if options.get("speech", True) else 0
+    frames = options.get("max_frames", 300) * MIB
+    return int(record.get("input_bytes", 0) * 2 + audio + frames)
+
+
 def validate_media(source):
     if source["duration_seconds"] > number("MAX_DURATION_SECONDS", 21600, 1):
         raise ResourceExhausted("Recording exceeds configured maximum duration")
@@ -103,6 +111,7 @@ class ResourceGuard:
                   "process_tree_memory_mb": round(rss / MIB, 1),
                   "peak_memory_mb": round(self.peak_rss_mb, 1),
                   "minimum_available_mb": round(self.minimum_available_mb, 1)}
+        values["scratch_free_mb"] = round(shutil.disk_usage(self.data).free / MIB, 1)
         if gpu and self.device == "cuda":
             current = gpu_memory()
             if current:

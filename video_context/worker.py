@@ -15,7 +15,7 @@ from .config import WHISPER_DEVICE, WHISPER_MODEL
 from .database import LeaseLost, now
 from .models import Options
 from .pipeline import analyze, caption_time, save_json, speech_model, write_exports
-from .resources import ResourceGuard, ResourceExhausted, check_disk, is_resource_error, number
+from .resources import ResourceGuard, ResourceExhausted, check_disk, is_resource_error, number, scratch_bytes
 
 log = logging.getLogger(__name__)
 
@@ -110,13 +110,19 @@ class Worker:
     def run_one(self):
         # Housekeeping must continue even while this worker is under pressure.
         self.db.claim(self.id, self.queues, admit=False)
+        candidate = self.db.peek(self.queues)
+        if candidate is None:
+            self.blocked_reason = None
+            return False
         try:
             self.guard.check(starting=True, model_loaded=speech_model.cache_info().currsize > 0)
+            check_disk(self.data, scratch_bytes(candidate))
             self.blocked_reason = None
         except ResourceExhausted as error:
             self.blocked_reason = str(error)
             return False
-        record = self.db.claim(self.id, self.queues, self.resource_domain, self.max_parallel, fail_on_worker_loss=True)
+        record = self.db.claim(self.id, self.queues, self.resource_domain, self.max_parallel,
+                               fail_on_worker_loss=True, expected_id=candidate["id"])
         if not record:
             return False
         self.current = record["id"]

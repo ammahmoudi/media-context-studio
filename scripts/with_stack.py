@@ -30,7 +30,7 @@ def configure():
         "VIDEO_CONTEXT_S3_BUCKET": "video-context",
         "AWS_ACCESS_KEY_ID": value("S3_ACCESS_KEY"), "AWS_SECRET_ACCESS_KEY": value("S3_SECRET_KEY"),
         "AWS_DEFAULT_REGION": "us-east-1", "VIDEO_CONTEXT_EMBEDDED_WORKER": "0",
-        "VIDEO_CONTEXT_DATA": str(ROOT / "data/native-stack"),
+        "VIDEO_CONTEXT_DATA": value("VIDEO_CONTEXT_NATIVE_DATA", str(ROOT / "data/native-stack")),
         "VIDEO_CONTEXT_API_KEY": value("VIDEO_CONTEXT_API_KEY"),
         "VIDEO_CONTEXT_CPU_THREADS": value("VIDEO_CONTEXT_CPU_THREADS", "4"),
         "OMP_NUM_THREADS": value("VIDEO_CONTEXT_CPU_THREADS", "4"),

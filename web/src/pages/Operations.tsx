@@ -391,6 +391,7 @@ export function Workers({
 							</div>
 						</div>
 						<p className="muted">Model: {w.model}</p>
+						{w.scratch_free_mb != null && <p className="muted">Scratch disk: {(w.scratch_free_mb / 1024).toFixed(1)} GiB free</p>}
 						{w.blocked_reason && <p className="error" role="status">Waiting for resources: {w.blocked_reason}</p>}
 						{w.memory_available_mb != null && <p className="muted">
 							{Math.round(w.memory_available_mb)} MiB available · {Math.round(w.memory_limit_mb ?? 0)} MiB {w.memory_scope} limit

@@ -56,6 +56,7 @@ export type Worker = {
 	peak_memory_mb?: number;
 	resource_domain?: string;
 	max_parallel?: number;
+	scratch_free_mb?: number;
 };
 export type Health = {
 	status: string;
