@@ -94,7 +94,7 @@ export default function App() {
 						<Layers3 size={22} />
 					</span>
 					<div>
-						Video Context<small>EXTRACTION STUDIO</small>
+						Media Context<small>EXTRACTION STUDIO</small>
 					</div>
 				</Link>
 				<div className="sidebar-label">WORKSPACE</div>
@@ -189,7 +189,7 @@ export default function App() {
 					{needsLogin ? (
 						<section className="panel login-panel">
 							<div className="eyebrow">PRIVATE WORKSPACE</div>
-							<h1>Welcome to your video studio.</h1>
+							<h1>Welcome to your media studio.</h1>
 							<p className="muted">Sign in with this service’s API key.</p>
 							<form
 								onSubmit={(e) => {
@@ -251,7 +251,7 @@ export default function App() {
 					)}
 					<footer>
 						<span>
-							Video Context ·{" "}
+							Media Context ·{" "}
 							{health.data?.worker_mode === "external"
 								? "Distributed workers"
 								: "Laptop mode"}

@@ -108,7 +108,7 @@ def create_app(data_root=DATA, settings=None):
         yield
         app.state.jobs.close()
 
-    app = FastAPI(title="Video Context", version="0.2.0", lifespan=lifespan, docs_url=None,
+    app = FastAPI(title="Media Context", version="0.2.0", lifespan=lifespan, docs_url=None,
                   description="Durable video extraction jobs, worker leases, private artifacts and video context.")
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=settings.allowed_hosts)
     app.add_middleware(BodyLimit, upload_limit=settings.max_upload_bytes, scratch=settings.data)
@@ -175,7 +175,7 @@ def create_app(data_root=DATA, settings=None):
 
     @app.get("/docs", include_in_schema=False)
     def swagger():
-        return get_swagger_ui_html(openapi_url="/openapi.json", title="Video Context API · Swagger",
+        return get_swagger_ui_html(openapi_url="/openapi.json", title="Media Context API · Swagger",
             swagger_js_url="/ui/swagger/swagger-ui-bundle.js", swagger_css_url="/ui/swagger/swagger-ui.css",
             swagger_favicon_url="/ui/swagger/favicon-32x32.png", swagger_ui_parameters={"validatorUrl": None})
 
