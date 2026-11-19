@@ -8,6 +8,18 @@ Built for course recordings, presentations, and applications that need grounded 
 
 [Getting started](#getting-started) · [Deployment](docs/production.md) · [Dashboard](docs/dashboard.md) · [API reference](docs/service.md)
 
+## Studio preview
+
+The operations overview brings processing, queue capacity, workers, and recent runs into one workspace.
+
+![Media Context Studio operations overview](docs/screenshots/overview.png)
+
+Choose a recording, configure speech and OCR, and select a processing queue.
+
+![New run with language, sampling, queue, and extraction settings](docs/screenshots/new-run.png)
+
+Screenshots show a fresh local workspace with no recordings or run history.
+
 ## Features
 
 - **Video extraction:** speech transcription, scene detection, sampled frames, and OCR with repeated-text deduplication.
