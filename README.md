@@ -2,7 +2,7 @@
 
 **Turn media into structured, searchable context.**
 
-A self-hosted extraction service and web workspace that turns recordings into timestamped evidence. Extract speech, on-screen text, scene boundaries, and frames; inspect them alongside the original video; and retrieve structured results through an HTTP API.
+A self-hosted extraction service and web workspace for video, audio, and still images. Extract speech, on-screen text, scene boundaries, and frames; inspect the evidence alongside its source; and retrieve structured results through an HTTP API.
 
 Built for course recordings, presentations, and applications that need grounded source material for later analysis.
 
@@ -18,11 +18,13 @@ Choose a recording, configure speech and OCR, and select a processing queue.
 
 ![New run with language, sampling, queue, and extraction settings](docs/screenshots/new-run.png)
 
-Screenshots show a fresh local workspace with no recordings or run history.
+Screenshots show local demonstration workspaces without private recordings.
 
 ## Features
 
 - **Video extraction:** speech transcription, scene detection, sampled frames, and OCR with repeated-text deduplication.
+- **Audio extraction:** standalone recordings produce timestamped transcripts and SRT/WebVTT captions, without video decoding or OCR.
+- **Image extraction:** single JPEG, PNG, WebP, BMP, and TIFF images produce an oriented preview and OCR evidence.
 - **Evidence workspace:** video playback, captions, transcript search, frame seeking, time-range queries, and durable run history.
 - **Portable results:** JSON, Markdown reports, SRT/WebVTT captions, and selectable ZIP or TAR.GZ downloads.
 - **Durable workers:** database-backed queues, leases, crash recovery, cancellation, retry, and resource reporting.
@@ -35,10 +37,10 @@ Screenshots show a fresh local workspace with no recordings or run history.
 | Input | Status |
 | --- | --- |
 | Video recordings, including their audio tracks | Supported |
-| Standalone audio files | Planned |
-| Standalone images | Planned |
+| Standalone audio files (WAV, MP3, FLAC, M4A, OGG, and other FFmpeg-decodable audio) | Supported |
+| Single still images (JPEG, PNG, WebP, BMP, TIFF) | Supported |
 
-The name reflects the intended direction. Standalone audio and image ingestion are not implemented yet.
+Choose the input type in **New run** to configure the relevant extraction settings. The worker detects the actual media type from file contents. Animated and multipage images are not supported. See [audio and image workflows](docs/media-inputs.md).
 
 ## Getting started
 
@@ -60,7 +62,7 @@ On a fresh deployment, prepare speech and OCR weights before submitting jobs:
 docker compose run --rm worker python -m video_context.cli prepare-models --ocr-language en
 ```
 
-Open **<http://127.0.0.1:18765/>**, sign in with `VIDEO_CONTEXT_API_KEY` from the generated `.env`, and upload a video through **New run**. Interactive API documentation is at **<http://127.0.0.1:18765/docs>**, using the same browser session.
+Open **<http://127.0.0.1:18765/>**, sign in with `VIDEO_CONTEXT_API_KEY` from the generated `.env`, and upload media through **New run**. Interactive API documentation is at **<http://127.0.0.1:18765/docs>**, using the same browser session.
 
 The stack includes an API, a CPU worker, PostgreSQL, and RustFS object storage. Model preparation needs internet access; prepared models can be reused offline. Keep `.env` private. The setup helper preserves existing credentials.
 
@@ -144,9 +146,8 @@ The bundled deployment is a single-node baseline. External hosting needs HTTPS, 
 
 ## Roadmap
 
-- Standalone audio ingestion and transcription.
-- Standalone image ingestion and OCR.
-- A common context representation across media types.
+- Broader image formats and multipage document workflows.
+- Richer cross-media search and context exploration.
 
 These are future directions rather than current capabilities or delivery commitments.
 
@@ -155,6 +156,7 @@ These are future directions rather than current capabilities or delivery commitm
 - [Deployment, queues, storage, GPU workers, access, and backups](docs/production.md)
 - [Dashboard and run workflows](docs/dashboard.md)
 - [API and extraction details](docs/service.md)
+- [Audio and image inputs, result schema, and compatibility](docs/media-inputs.md)
 - [Research and original scope](docs/video-context.md)
 
 Some detailed notes describe earlier versions and local experiments; the deployment guide covers the durable architecture. Videos, model weights, databases, and credentials are excluded from Git.

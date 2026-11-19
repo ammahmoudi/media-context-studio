@@ -12,7 +12,7 @@ from .models import Options
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Local course video context")
+    parser = argparse.ArgumentParser(description="Media Context Studio: video, audio and image extraction")
     commands = parser.add_subparsers(dest="command", required=True)
     serve = commands.add_parser("serve", help="Run the loopback HTTP API")
     serve.add_argument("--port", type=int, default=18765)
@@ -105,7 +105,7 @@ def main():
 
         path = args.path.resolve()
         if not path.is_file():
-            parser.error(f"Video not found: {path}")
+            parser.error(f"Media not found: {path}")
         if args.output.exists() and any(args.output.iterdir()):
             parser.error("Output directory is not empty; choose a new output directory")
         options = Options(language=args.language, ocr_language=args.ocr_language,

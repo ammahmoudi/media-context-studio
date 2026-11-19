@@ -18,6 +18,7 @@ export default function NewRun({
 	navigate: Navigate;
 }) {
 	const [mode, setMode] = useState(health.allow_path ? "path" : "upload");
+	const [mediaType, setMediaType] = useState("video");
 	const [queueChoice, setQueueChoice] = useState("");
 	const preferredQueue =
 		queueChoice ||
@@ -31,12 +32,12 @@ export default function NewRun({
 				queue = String(f.get("queue"));
 			const options = {
 				language: f.get("language") || null,
-				ocr_language: f.get("ocr_language"),
+				ocr_language: f.get("ocr_language") || "en",
 				speech: f.has("speech"),
 				ocr: f.has("ocr"),
 				ocr_deduplicate: f.has("deduplicate"),
-				sample_interval_seconds: Number(f.get("interval")),
-				max_frames: Number(f.get("max_frames")),
+				sample_interval_seconds: Number(f.get("interval") || 30),
+				max_frames: Number(f.get("max_frames") || 300),
 			};
 			if (mode === "upload") {
 				const body = new FormData();
@@ -65,9 +66,9 @@ export default function NewRun({
 			<div className="intro">
 				<div>
 					<div className="eyebrow">NEW EXTRACTION</div>
-					<h1>Give your next video some context.</h1>
+					<h1>Give your media some context.</h1>
 					<p>
-						Save a recording, choose what to extract, and let an available
+						Choose video, audio, or a still image, and let an available
 						worker take it from there.
 					</p>
 				</div>
@@ -77,7 +78,7 @@ export default function NewRun({
 					<div className="panel-heading">
 						<h2>
 							<FileVideo size={18} />
-							Video & extraction settings
+							Media & extraction settings
 						</h2>
 						<span className="muted">
 							{snapshot?.available_slots ?? "—"} slots available
@@ -89,6 +90,15 @@ export default function NewRun({
 							submit.mutate(e.currentTarget);
 						}}
 					>
+						<label>
+							Input type
+							<select value={mediaType} onChange={(e) => setMediaType(e.target.value)}>
+								<option value="video">Video · speech, frames & OCR</option>
+								<option value="audio">Audio · transcription & captions</option>
+								<option value="image">Image · text recognition</option>
+							</select>
+							<small>Choose settings for your input. The worker detects the actual media type.</small>
+						</label>
 						{health.allow_path && (
 							<div className="mode-switch">
 								{["path", "upload"].map((m) => (
@@ -98,14 +108,14 @@ export default function NewRun({
 										key={m}
 										onClick={() => setMode(m)}
 									>
-										{m === "path" ? "Local file path" : "Upload a recording"}
+										{m === "path" ? "Local file path" : "Upload media"}
 									</button>
 								))}
 							</div>
 						)}
 						{mode === "path" ? (
 							<label>
-								Full video path
+								Full media path
 								<Input
 									name="path"
 									required
@@ -119,8 +129,8 @@ export default function NewRun({
 						) : (
 							<label className="upload-box">
 								<Upload size={28} />
-								<span>Choose your recording</span>
-								<Input type="file" name="file" accept="video/*,.mkv" required />
+								<span>Choose your {mediaType}</span>
+								<Input key={mediaType} type="file" name="file" accept={mediaType === "audio" ? "audio/*,.mp3,.wav,.flac,.m4a,.ogg,.aac" : mediaType === "image" ? ".jpg,.jpeg,.png,.webp,.bmp,.tif,.tiff" : "video/*,.mkv"} required />
 								<small>
 									Input and extracted artifacts stay in private storage.
 								</small>
@@ -129,7 +139,7 @@ export default function NewRun({
 						<div className="form-grid">
 							<label>
 								Spoken language
-								<select name="language" defaultValue="fa">
+								<select name="language" defaultValue="" disabled={mediaType === "image"}>
 									<option value="">Auto-detect</option>
 									<option value="fa">Persian</option>
 									<option value="en">English</option>
@@ -137,8 +147,8 @@ export default function NewRun({
 								</select>
 							</label>
 							<label>
-								Screen text language
-								<select name="ocr_language" defaultValue="en">
+								Text recognition language
+								<select name="ocr_language" defaultValue="en" disabled={mediaType === "audio"}>
 									{(health.prepared_ocr_profiles.length
 										? health.prepared_ocr_profiles
 										: ["en"]
@@ -161,6 +171,7 @@ export default function NewRun({
 								Frame interval (seconds)
 								<Input
 									name="interval"
+									disabled={mediaType !== "video"}
 									type="number"
 									min={1}
 									max={600}
@@ -172,6 +183,7 @@ export default function NewRun({
 								Maximum frames
 								<Input
 									name="max_frames"
+									disabled={mediaType !== "video"}
 									type="number"
 									min={1}
 									max={2000}
@@ -197,15 +209,15 @@ export default function NewRun({
 						</label>
 						<div className="checks">
 							<label>
-								<input name="speech" type="checkbox" defaultChecked />
+								<input key={`speech-${mediaType}`} name="speech" type="checkbox" defaultChecked={mediaType !== "image"} disabled={mediaType === "image"} />
 								Speech transcription & captions
 							</label>
 							<label>
-								<input name="ocr" type="checkbox" defaultChecked />
-								Screen text (OCR)
+								<input key={`ocr-${mediaType}`} name="ocr" type="checkbox" defaultChecked={mediaType !== "audio"} disabled={mediaType === "audio"} />
+								Text recognition (OCR)
 							</label>
 							<label>
-								<input name="deduplicate" type="checkbox" defaultChecked />
+								<input name="deduplicate" type="checkbox" defaultChecked disabled={mediaType !== "video"} />
 								Reuse unchanged text between frames
 							</label>
 						</div>
@@ -233,7 +245,7 @@ export default function NewRun({
 					<ol>
 						<li>
 							<strong>Store once</strong>
-							<p>Identical source videos share a content-addressed object.</p>
+							<p>Identical source files share a content-addressed object.</p>
 						</li>
 						<li>
 							<strong>Join the queue</strong>

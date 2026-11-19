@@ -1,5 +1,7 @@
 # Local course video service
 
+The service now accepts standalone audio and still images as well as video. See [media input workflows and schema](./media-inputs.md) for current behavior. Historical setup and examples below include details of the original video-only implementation.
+
 Version 0.2 adds PostgreSQL/SQLite job persistence, a durable leased queue, independent workers, S3-compatible storage, authenticated browser/API access, ranged video playback, WebVTT captions, cancellation, and retry. See [deployment/configuration](./production.md). The Docker stack runs at the original local URL; clients now need an authenticated session or `X-API-Key`. Earlier CPU/setup notes below describe the initial service.
 
 The service now includes a [local web dashboard](http://127.0.0.1:18765/) and offline Swagger at <http://127.0.0.1:18765/docs>. See [dashboard instructions](./dashboard.md) for job submission, live queue/history, result browsing, and frontend builds. `GET /v1/jobs` exposes running jobs, queue positions, and paginated history for other clients.

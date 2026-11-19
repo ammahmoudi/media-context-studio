@@ -12,27 +12,27 @@ export default function RunExport({ id }: { id: string }) {
 	const [selection, setSelection] = useState<string[] | null>(null);
 	const [format, setFormat] = useState("zip");
 	const files = catalog.data?.files ?? [];
-	const selected = selection ?? files.filter((f) => f.kind !== "video").map((f) => f.path);
+	const selected = selection ?? files.filter((f) => !["video", "audio", "image"].includes(f.kind)).map((f) => f.path);
 	const size = files.filter((f) => selected.includes(f.path)).reduce((sum, f) => sum + f.bytes, 0);
 	function toggle(path: string) {
 		setSelection(selected.includes(path) ? selected.filter((p) => p !== path) : [...selected, path]);
 	}
 	return <section className="panel export-panel" aria-label="Download run files">
 		<h2>Download run files</h2>
-		<p className="muted">Choose all files or a selection. The original video is optional. Only published results are available.</p>
+		<p className="muted">Choose all files or a selection. The original media is optional. Only published results are available.</p>
 		{catalog.isPending && <p>Loading available files…</p>}
 		{catalog.isError && <p role="alert" className="error">{catalog.error.message}</p>}
 		{catalog.data && <>
 			<div className="export-controls">
 				<Button variant="outline" onClick={() => setSelection(files.map((f) => f.path))}>All files</Button>
-				<Button variant="outline" onClick={() => setSelection(files.filter((f) => f.kind !== "video").map((f) => f.path))}>Results only</Button>
+				<Button variant="outline" onClick={() => setSelection(files.filter((f) => !["video", "audio", "image"].includes(f.kind)).map((f) => f.path))}>Results only</Button>
 				<Button variant="outline" onClick={() => setSelection([])}>Clear</Button>
-				{["context", "captions", "frames", "video"].map((kind) => {
+				{["context", "captions", "frames", "video", "audio", "image"].map((kind) => {
 					const group = files.filter((f) => f.kind === kind);
 					return group.length > 0 && <label key={kind}>
 						<input type="checkbox" checked={group.every((f) => selected.includes(f.path))} onChange={(e) => {
 							setSelection(e.target.checked ? [...new Set([...selected, ...group.map((f) => f.path)])] : selected.filter((p) => !group.some((f) => f.path === p)));
-						}} />{kind === "video" ? "Original video" : kind === "context" ? "Context / report" : kind === "captions" ? "Captions" : "Frames"} ({group.length})
+						}} />{["video", "audio", "image"].includes(kind) ? `Original ${kind}` : kind === "context" ? "Context / report" : kind === "captions" ? "Captions" : "Frames"} ({group.length})
 					</label>;
 				})}
 			</div>

@@ -93,6 +93,7 @@ class DashboardFiles(StaticFiles):
 
 def public_record(record):
     return {**{k: v for k, v in record.items() if k not in ("legacy_dir", "input_key", "result_prefix")},
+            "media_available": bool(record.get("input_key")),
             "video_available": bool(record.get("input_key"))}
 
 
@@ -109,7 +110,7 @@ def create_app(data_root=DATA, settings=None):
         app.state.jobs.close()
 
     app = FastAPI(title="Media Context", version="0.2.0", lifespan=lifespan, docs_url=None,
-                  description="Durable video extraction jobs, worker leases, private artifacts and video context.")
+                  description="Durable video, audio and image extraction, worker leases, and private media context.")
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=settings.allowed_hosts)
     app.add_middleware(BodyLimit, upload_limit=settings.max_upload_bytes, scratch=settings.data)
     default_openapi = app.openapi
@@ -228,10 +229,10 @@ def create_app(data_root=DATA, settings=None):
     @app.post("/v1/jobs", status_code=202, tags=["Jobs"])
     def submit(body: AnalyzeRequest):
         if not settings.allow_path:
-            raise HTTPException(403, "Server-side paths are disabled; upload a video instead")
+            raise HTTPException(403, "Server-side paths are disabled; upload media instead")
         path = Path(body.path).expanduser().resolve()
         if not path.is_file():
-            raise HTTPException(422, "Local video file does not exist")
+            raise HTTPException(422, "Local media file does not exist")
         return public_record(app.state.jobs.submit(path, body.options, body.queue))
 
     @app.post("/v1/jobs/upload", status_code=202, tags=["Jobs"])
@@ -293,12 +294,14 @@ def create_app(data_root=DATA, settings=None):
             raise HTTPException(409, "Job is not finished; poll its status")
         return app.state.jobs.context(record)
 
+    @app.get("/v1/jobs/{job_id}/media", tags=["Results"])
+    @app.head("/v1/jobs/{job_id}/media", include_in_schema=False)
     @app.get("/v1/jobs/{job_id}/video", tags=["Results"])
     @app.head("/v1/jobs/{job_id}/video", include_in_schema=False)
     def video(job_id: str, request: Request):
         record = app.state.jobs.get(job_id)
         if not record.get("input_key"):
-            raise HTTPException(404, "Video is unavailable; import the original video or submit a new job")
+            raise HTTPException(404, "Source media is unavailable; submit a new job")
         return app.state.jobs.storage.response(record["input_key"], request)
 
     @app.get("/v1/jobs/{job_id}/artifacts/{artifact:path}", tags=["Results"])
@@ -352,7 +355,8 @@ def create_app(data_root=DATA, settings=None):
     @app.get("/v1/jobs/{job_id}/context", tags=["Results"])
     def interval(job_id: str, start: float = 0, end: float | None = None):
         context = app.state.jobs.context(app.state.jobs.get(job_id))
-        end = end if end is not None else context["source"]["duration_seconds"]
+        # A still image is one observation at t=0, without a synthetic duration.
+        end = end if end is not None else (1 if context["source"].get("media_type") == "image" else context["source"]["duration_seconds"])
         if start < 0 or end <= start or not all(map(math.isfinite, (start, end))):
             raise HTTPException(422, "Expected finite times with 0 <= start < end")
         frames = [f for f in context["frames"] if start <= f["timestamp_seconds"] < end]

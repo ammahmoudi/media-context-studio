@@ -40,24 +40,60 @@ def run(command):
 
 
 def inspect(path: Path):
+    from PIL import Image, UnidentifiedImageError
+
+    # Detect still images by their contents, not their filename or MIME header.
+    try:
+        image = Image.open(path)
+    except UnidentifiedImageError:
+        image = None
+    if image is not None:
+        with image:
+            if image.format not in {"JPEG", "PNG", "WEBP", "BMP", "TIFF"}:
+                raise ValueError("Supported still images: JPEG, PNG, WebP, BMP, TIFF")
+            width, height = image.size
+            if width * height > number("MAX_VIDEO_PIXELS", 3840 * 2160, 1):
+                raise ResourceExhausted("Image exceeds configured decoded pixel limit; resize before submitting")
+            if getattr(image, "n_frames", 1) != 1:
+                raise ValueError("Animated and multipage images are not supported; submit a single still image")
+            if image.getexif().get(274, 1) in (5, 6, 7, 8):
+                width, height = height, width
+        # Some format metadata access loads the image; verify on a fresh handle.
+        with Image.open(path) as verification:
+            verification.verify()
+        return {"file_name": path.name, "media_type": "image", "duration_seconds": 0,
+                "width": width, "height": height, "has_audio": False,
+                "timeline_origin_seconds": 0, "rotation_degrees": 0,
+                "video_stream_index": None, "video_offset_seconds": 0,
+                "audio_offset_seconds": None, "audio_stream_index": None}
     raw = json.loads(run(["ffprobe", "-v", "error", "-show_format", "-show_streams",
                           "-of", "json", str(path)]))
     videos = [s for s in raw["streams"] if s["codec_type"] == "video"
               and not s.get("disposition", {}).get("attached_pic")]
-    if not videos:
-        raise ValueError("Input has no playable video stream")
-    video = videos[0]
+    video = videos[0] if videos else None
     audio = next((s for s in raw["streams"] if s["codec_type"] == "audio"), None)
+    if video is None and audio is None:
+        raise ValueError("Input has no playable video or audio stream")
+    primary = video or audio
     origin = float(raw["format"].get("start_time", 0))
-    duration = float(raw["format"].get("duration", video.get("duration", 0)))
+    duration = float(raw["format"].get("duration", primary.get("duration", 0)))
     if not math.isfinite(duration) or duration <= 0:
-        raise ValueError("Video duration is missing or invalid")
+        raise ValueError("Media duration is missing or invalid")
+    if video is None:
+        return {"file_name": path.name, "media_type": "audio", "duration_seconds": duration,
+                "width": 0, "height": 0, "has_audio": True,
+                "timeline_origin_seconds": origin, "rotation_degrees": 0,
+                "video_stream_index": None, "video_offset_seconds": 0,
+                "audio_offset_seconds": float(audio.get("start_time", origin)) - origin,
+                "audio_stream_index": audio["index"]}
     rotation = next((float(s["rotation"]) for s in video.get("side_data_list", [])
                      if "rotation" in s), float(video.get("tags", {}).get("rotate", 0)))
     width, height = video["width"], video["height"]
+    if width <= 0 or height <= 0:
+        raise ValueError("Input has invalid decoded dimensions")
     if round(rotation) % 180:
         width, height = height, width
-    return {"file_name": path.name, "duration_seconds": duration, "width": width,
+    return {"file_name": path.name, "media_type": "video", "duration_seconds": duration, "width": width,
             "height": height, "has_audio": audio is not None,
             "timeline_origin_seconds": origin, "rotation_degrees": rotation,
             "video_stream_index": video["index"],
@@ -166,6 +202,20 @@ def extract_frames(path, folder, source, shots, options):
     return frames, capped
 
 
+def extract_image(path, folder):
+    from PIL import Image, ImageOps
+
+    relative = "frames/frame_00001.jpg"
+    (folder / "frames").mkdir(exist_ok=True)
+    with Image.open(path) as loaded:
+        image = ImageOps.exif_transpose(loaded).convert("RGB")
+        # Preserve native resolution for still-image OCR within the pixel limit.
+        image.save(folder / relative, quality=95)
+    return [{"id": "frame_00001", "shot_id": None, "timestamp_seconds": 0,
+             "source_pts": None, "source_time_base": None, "width": image.width,
+             "height": image.height, "path": relative}]
+
+
 @lru_cache(maxsize=1)
 def speech_model(download=False):
     if WHISPER_DEVICE == "cuda":
@@ -181,6 +231,11 @@ def speech_model(download=False):
 
 @lru_cache(maxsize=1)
 def ocr_model(language="en"):
+    if os.name == "nt":
+        # Paddle loads native DLLs that can prevent CTranslate2 loading later.
+        # Image-first workers must still be able to transcribe the next audio job.
+        # Import only the runtime here, without loading speech weights or CUDA.
+        import ctranslate2  # noqa: F401
     from paddleocr import PaddleOCR
 
     manifest = MODELS / "ocr" / f"{language}.json"
@@ -307,7 +362,7 @@ def write_exports(folder, context):
     srt = "\n\n".join(f"{i}\n{caption_time(s['start_seconds'])} --> {caption_time(s['end_seconds'])}\n{s['text']}"
                         for i, s in enumerate(speech, 1))
     (folder / "captions/speech.srt").write_text(srt, encoding="utf-8")
-    lines = ["# Course video context", "", context["source"]["file_name"], "",
+    lines = ["# Media context", "", context["source"]["file_name"], "",
              "Extracted evidence. Visual descriptions and subject summaries are not generated.", "",
              f"Status: {context['status']}", ""]
     for warning in context["warnings"]:
@@ -325,6 +380,12 @@ def write_exports(folder, context):
                 if reused:
                     lines.append(f"{len(reused)} unchanged text observations reused; see JSON evidence frame_ids.")
                 lines.append("")
+    if context["source"].get("media_type") == "image":
+        lines.extend(["## Image text", ""])
+        for frame in context["frames"]:
+            lines.extend([f"[View image]({frame['path']})", ""])
+        lines.extend(f"- {item['text']}" for item in context["on_screen_text"])
+        lines.append("")
     lines.extend(["## Speech transcript", ""])
     for segment in speech:
         lines.extend([f"[{segment['start_seconds']:.2f}–{segment['end_seconds']:.2f}] {segment['text']}", ""])
@@ -337,7 +398,8 @@ def analyze(path: Path, folder: Path, options: Options, progress=lambda stage: N
     progress("metadata")
     source = inspect(path)
     validate_media(source)
-    check_disk(folder, options.max_frames * 1024**2)
+    media_type = source["media_type"]
+    check_disk(folder, (options.max_frames if media_type == "video" else 1 if media_type == "image" else 0) * 1024**2)
     with path.open("rb") as handle:
         source["sha256"] = hashlib.file_digest(handle, "sha256").hexdigest()
     packages = ["fastapi", "faster-whisper", "scenedetect", "paddleocr", "paddlepaddle", "av"]
@@ -372,8 +434,11 @@ def analyze(path: Path, folder: Path, options: Options, progress=lambda stage: N
     def shots():
         context["shots"] = detect_shots(path, source)
 
-    stage("shots", "pyscenedetect", shots)
-    if not context["shots"]:
+    if media_type == "video":
+        stage("shots", "pyscenedetect", shots)
+    else:
+        context["stages"]["shots"] = {"status": "skipped", "reason": f"not applicable to {media_type}"}
+    if media_type == "video" and not context["shots"]:
         context["shots"] = [{"id": "shot_00001", "start_seconds": max(0, source["video_offset_seconds"]),
                              "end_seconds": source["duration_seconds"], "frame_ids": []}]
 
@@ -385,7 +450,12 @@ def analyze(path: Path, folder: Path, options: Options, progress=lambda stage: N
         if capped:
             context["warnings"].append("Frame cap applied: samples spread across recording; some shots may have no frames.")
 
-    stage("frames", "pyav", frames)
+    if media_type == "video":
+        stage("frames", "pyav", frames)
+    elif media_type == "image":
+        stage("frames", "pillow", lambda: context.update(frames=extract_image(path, folder)))
+    else:
+        context["stages"]["frames"] = {"status": "skipped", "reason": "not applicable to audio"}
     if options.speech and source["has_audio"]:
         stage("speech", "faster-whisper", lambda: context.update(speech_segments=transcribe(path, folder, source, options, progress)))
     else:

@@ -1622,3 +1622,15 @@ main.studio-content {
 .export-file-picker label { display: flex; align-items: center; gap: 10px; padding: 8px 12px; font-size: 13px; }
 .export-file-picker label span { flex: 1; overflow-wrap: anywhere; }
 .export-file-picker input, .export-controls input[type=checkbox] { width: 16px; height: 16px; accent-color: #286b51; flex-shrink: 0; }
+.video-panel .source-image {
+	display: block;
+	width: 100%;
+	max-height: 640px;
+	object-fit: contain;
+	background: #f6f8f7;
+}
+.video-panel audio {
+	display: block;
+	width: calc(100% - 40px);
+	margin: 32px 20px;
+}

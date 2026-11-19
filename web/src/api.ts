@@ -1,3 +1,9 @@
+export type MediaSource = {
+	media_type?: "video" | "audio" | "image";
+	duration_seconds: number;
+	width?: number;
+	height?: number;
+};
 export type Job = {
 	id: string;
 	status: string;
@@ -13,9 +19,10 @@ export type Job = {
 	worker_id?: string;
 	attempt?: number;
 	video_available?: boolean;
+	media_available?: boolean;
 	input_bytes?: number;
 	finished_at?: string;
-	source?: { duration_seconds: number; width: number; height: number };
+	source?: MediaSource;
 	artifacts?: { path: string; bytes: number }[];
 	resources?: { peak_memory_mb: number; peak_gpu_memory_mb?: number; memory_limit_mb: number };
 	error_code?: string;
@@ -73,7 +80,7 @@ export type Context = {
 	status?: string;
 	warnings?: string[];
 	elapsed_seconds?: number;
-	source?: { duration_seconds: number };
+	source?: MediaSource;
 	stages?: Record<
 		string,
 		{ status: string; elapsed_seconds?: number; error?: string }

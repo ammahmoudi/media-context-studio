@@ -32,7 +32,7 @@ export default function RunDetail({
 	navigate: Navigate;
 }) {
 	const client = useQueryClient(),
-		player = useRef<HTMLVideoElement>(null);
+		player = useRef<HTMLMediaElement | null>(null);
 	const [tab, setTab] = useState("Overview"),
 		[page, setPage] = useState(0),
 		[search, setSearch] = useState(""),
@@ -79,6 +79,9 @@ export default function RunDetail({
 	}
 	const r = job.data,
 		context = windowResult ?? result.data;
+	const mediaType = result.data?.source?.media_type ?? r?.source?.media_type ?? "video";
+	const sourceUrl = `/v1/jobs/${id}/media`;
+	const tabs = mediaType === "audio" ? ["Overview", "Transcript", "Files"] : mediaType === "image" ? ["Overview", "Screen text", "Frames", "Files"] : ["Overview", "Transcript", "Screen text", "Frames", "Files"];
 	const transcript = (context?.speech_segments ?? []).filter((s) =>
 		s.text.toLocaleLowerCase().includes(search.toLocaleLowerCase()),
 	);
@@ -143,7 +146,7 @@ export default function RunDetail({
 								Retry as new run
 							</Button>
 						)}
-					{result.data && (
+					{!!result.data?.speech_segments.length && (
 						<Button asChild variant="outline">
 							<a href={artifact(id, "captions/speech.srt")} download>
 								<Download size={14} />
@@ -176,23 +179,27 @@ export default function RunDetail({
 				<section className="video-panel">
 					<div className="video-title">
 						<Film size={16} />
-						Source video
+						Source {mediaType}
 						<span>
-							{duration(
+							{mediaType === "image" ? "Still image" : duration(
 								result.data?.source?.duration_seconds ??
 									r?.source?.duration_seconds,
 							)}
 						</span>
 					</div>
-					{r?.video_available ? (
+					{r?.video_available && mediaType === "image" ? (
+						<img className="source-image" src={result.data?.frames[0] ? artifact(id, result.data.frames[0].path) : sourceUrl} alt={r.source_file} onLoad={() => setVideoError(false)} onError={() => setVideoError(true)} />
+					) : r?.video_available && mediaType === "audio" ? (
+						<audio key={id} ref={(element) => { player.current = element; }} controls preload="metadata" src={sourceUrl} onLoadedMetadata={() => setVideoError(false)} onError={() => setVideoError(true)} />
+					) : r?.video_available ? (
 						<video
 							key={id}
-							ref={player}
+							ref={(element) => { player.current = element; }}
 							controls
 							preload="metadata"
 							onError={() => setVideoError(true)}
 						>
-							<source src={`/v1/jobs/${id}/video`} />
+							<source src={sourceUrl} />
 							{!!result.data?.speech_segments.length && (
 								<track
 									kind="captions"
@@ -207,9 +214,9 @@ export default function RunDetail({
 					) : (
 						<div className="video-unavailable">
 							<Film size={30} />
-							<strong>Source video is unavailable</strong>
+							<strong>Source media is unavailable</strong>
 							<p>
-								Import the original video or create a new run to enable
+								Import the original media or create a new run to enable
 								playback.
 							</p>
 						</div>
@@ -218,13 +225,13 @@ export default function RunDetail({
 						{videoError && (
 							<p>
 								Browser playback failed.{" "}
-								<a href={`/v1/jobs/${id}/video`} download>
-									Download the source video
+								<a href={sourceUrl} download>
+									Download the source media
 								</a>{" "}
 								to play it locally.
 							</p>
 						)}
-						{result.data?.speech_segments.length
+						{mediaType === "image" ? "Text recognition uses the oriented image. Open Screen text to inspect the extracted text." : mediaType === "audio" ? "Search the transcript and select a timestamp to seek the audio. Captions are available as downloads." : result.data?.speech_segments.length
 							? "Captions are generated from the saved speech transcript. Toggle them with the player’s captions control."
 							: "Captions appear after speech extraction completes."}
 					</div>
@@ -275,7 +282,7 @@ export default function RunDetail({
 					role="tablist"
 					aria-label="Run views"
 				>
-					{["Overview", "Transcript", "Screen text", "Frames", "Files"].map(
+					{tabs.map(
 						(t) => (
 							<button
 								role="tab"
@@ -343,7 +350,7 @@ export default function RunDetail({
 								</p>
 							</>
 						)}
-						{["Transcript", "Screen text", "Frames"].includes(tab) && (
+						{mediaType !== "image" && ["Transcript", "Screen text", "Frames"].includes(tab) && (
 							<form
 								className="range-form"
 								onSubmit={(e) => {
@@ -477,13 +484,13 @@ export default function RunDetail({
 														loading="lazy"
 													/>
 												</a>
-												<button
+												{mediaType !== "image" && <button
 													className="seek-button"
 													onClick={() => seek(f.timestamp_seconds)}
 												>
 													<Play size={12} />
 													{duration(f.timestamp_seconds)}
-												</button>
+												</button>}
 											</div>
 										))}
 								</div>
@@ -519,7 +526,7 @@ export default function RunDetail({
 											title: "Web captions",
 											hint: "WebVTT · browser playback",
 										},
-									].map((f) => (
+									].filter((f) => !f.path.startsWith("captions/") || !!result.data?.speech_segments.length).map((f) => (
 										<a href={artifact(id, f.path)} key={f.path} download>
 											<FileJson size={22} />
 											<div>

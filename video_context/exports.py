@@ -43,8 +43,9 @@ def catalog(manager, record):
         size = record.get("input_bytes")
         if size is None:
             size = manager.storage.size(record["input_key"])
-        entries.append({"path": "source/video" + suffix, "bytes": size,
-                        "kind": "video", "key": record["input_key"]})
+        kind = (record.get("source") or {}).get("media_type", "video")
+        entries.append({"path": "source/" + kind + suffix, "bytes": size,
+                        "kind": kind, "key": record["input_key"]})
     unique = {e["path"]: e for e in entries}
     if len(unique) > 4096:
         raise HTTPException(413, "Too many files in this export")

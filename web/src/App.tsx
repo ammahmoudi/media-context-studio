@@ -256,7 +256,7 @@ export default function App() {
 								? "Distributed workers"
 								: "Laptop mode"}
 						</span>
-						<span>Private video → structured evidence</span>
+						<span>Private media → structured evidence</span>
 					</footer>
 				</main>
 			</div>
